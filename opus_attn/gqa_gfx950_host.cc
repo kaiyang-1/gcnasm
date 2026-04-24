@@ -70,9 +70,10 @@ void benchmark_gqa_kernel(const opus_gqa_kargs& kargs, dim3 grid, dim3 block,
     CHECK_HIP(hipEventDestroy(stop));
 
     const float avg_time = total_time / iterations;
-    //   full attention  -> 4 * B * H * N^2 * D
+    //   Q @ K^T -> 2 * B * H * N^2 * D
+    //   P @ V   -> 2 * B * H * N^2 * D_V
     //   causal attention -> half of the full-attention work
-    const double flops = (4.0 * kargs.B * kargs.H * kargs.N * kargs.N * kargs.D)
+    const double flops = (2.0 * kargs.B * kargs.H * kargs.N * kargs.N * (kargs.D + kargs.D_V))
                        / (Traits::CAUSAL ? 2.0 : 1.0);
     const double tflops = flops / (avg_time * 1e-3) / 1e12;
 
@@ -82,7 +83,7 @@ void benchmark_gqa_kernel(const opus_gqa_kargs& kargs, dim3 grid, dim3 block,
 
 // Validate GQA GPU results against CPU reference
 bool validate_gqa_results(const bf16_t* ref, const bf16_t* gpu,
-                          int B, int N, int H, int D, float threshold = 5e-2f) {
+                          int B, int N, int H, int D_V, float threshold = 5e-2f) {
     bool all_valid = true;
     int total_errors = 0;
 
@@ -93,12 +94,12 @@ bool validate_gqa_results(const bf16_t* ref, const bf16_t* gpu,
     for (int b = 0; b < B; b++) {
         for (int h = 0; h < sample_heads; h++) {
             for (int i = 0; i < sample_queries; i++) {
-                int offset = b * N * H * D + i * H * D + h * D;
+                int offset = b * N * H * D_V + i * H * D_V + h * D_V;
                 
                 // Check element-wise
                 int local_errors = 0;
                 float max_diff = 0.0f;
-                for (int d = 0; d < D; d++) {
+                for (int d = 0; d < D_V; d++) {
                     float ref_val = static_cast<float>(ref[offset + d]);
                     float gpu_val = static_cast<float>(gpu[offset + d]);
                     float diff = std::abs(ref_val - gpu_val);
@@ -111,7 +112,7 @@ bool validate_gqa_results(const bf16_t* ref, const bf16_t* gpu,
                 
                 if (local_errors > 0) {
                     printf("  [b=%d,h=%d,n=%d] max_diff=%.6f, errors=%d/%d\n",
-                           b, h, i, max_diff, local_errors, D);
+                           b, h, i, max_diff, local_errors, D_V);
                     all_valid = false;
                 }
             }
@@ -130,34 +131,42 @@ bool validate_gqa_results(const bf16_t* ref, const bf16_t* gpu,
 
 // ─── CPU reference: Grouped-Query Attention (GQA) ──────────────────────────
 //
-// Q  layout: [B, N, H,    D]   (row-major, contiguous in D)
+// Q  layout: [B, N, H,    D]     (row-major, contiguous in D)
 // K  layout: [B, N, H_KV, D]
-// V  layout: [B, N, H_KV, D]
-// O  layout: [B, N, H,    D]
+// V  layout: [B, N, H_KV, D_V]
+// O  layout: [B, N, H,    D_V]
 //
 // Standard scaled-dot-product attention with online softmax:
 //   S[i,j]  = sum_d Q[b,i,h,d] * K[b,j,h_kv,d]   (h_kv = h / group_size)
 //   P[i,:]  = softmax( S[i,:] / sqrt(D) )
-//   O[i,d]  = sum_j P[i,j] * V[b,j,h_kv,d]
+//   O[i,d_v] = sum_j P[i,j] * V[b,j,h_kv,d_v]
 //
 void gqa_attention_ref(
     const bf16_t* Q,  // [B, N, H, D]
     const bf16_t* K,  // [B, N, H_KV, D]
-    const bf16_t* V,  // [B, N, H_KV, D]
-    bf16_t*       O,  // [B, N, H, D]
-    int B, int N, int H, int H_KV, int D, bool causal = false)
+    const bf16_t* V,  // [B, N, H_KV, D_V]
+    bf16_t*       O,  // [B, N, H, D_V]
+    int B, int N, int H, int H_KV, int D, int D_V, bool causal = false)
 {
     const int GROUP_SIZE = H / H_KV;
     const float scale = 1.0f / std::sqrt(static_cast<float>(D));
 
-    // Strides (row-major, last dim = D is contiguous)
+    // Strides (row-major, last dim is contiguous)
     const int stride_q_b = N * H * D;
     const int stride_q_n = H * D;
     const int stride_q_h = D;
 
-    const int stride_kv_b = N * H_KV * D;
-    const int stride_kv_n = H_KV * D;
-    const int stride_kv_h = D;
+    const int stride_k_b = N * H_KV * D;
+    const int stride_k_n = H_KV * D;
+    const int stride_k_h = D;
+
+    const int stride_v_b = N * H_KV * D_V;
+    const int stride_v_n = H_KV * D_V;
+    const int stride_v_h = D_V;
+
+    const int stride_o_b = N * H * D_V;
+    const int stride_o_n = H * D_V;
+    const int stride_o_h = D_V;
 
     #pragma omp parallel for collapse(3)
     for (int b = 0; b < B; b++) {
@@ -170,7 +179,7 @@ void gqa_attention_ref(
                 const int max_j = causal ? (i + 1) : N;
                 std::vector<float> scores(max_j);
                 for (int j = 0; j < max_j; j++) {
-                    const bf16_t* k_row = K + b * stride_kv_b + j * stride_kv_n + h_kv * stride_kv_h;
+                    const bf16_t* k_row = K + b * stride_k_b + j * stride_k_n + h_kv * stride_k_h;
                     float dot = 0.0f;
                     for (int d = 0; d < D; d++) {
                         dot += static_cast<float>(q_row[d]) * static_cast<float>(k_row[d]);
@@ -189,12 +198,12 @@ void gqa_attention_ref(
                     scores[j] /= sum_exp;
                 }
 
-                // ---- Output: O[b,i,h,d] = sum_j P[j] * V[b,j,h_kv,d] ----
-                bf16_t* o_row = O + b * stride_q_b + i * stride_q_n + h * stride_q_h;
-                for (int d = 0; d < D; d++) {
+                // ---- Output: O[b,i,h,d_v] = sum_j P[j] * V[b,j,h_kv,d_v] ----
+                bf16_t* o_row = O + b * stride_o_b + i * stride_o_n + h * stride_o_h;
+                for (int d = 0; d < D_V; d++) {
                     float acc = 0.0f;
                     for (int j = 0; j < max_j; j++) {
-                        const bf16_t* v_row = V + b * stride_kv_b + j * stride_kv_n + h_kv * stride_kv_h;
+                        const bf16_t* v_row = V + b * stride_v_b + j * stride_v_n + h_kv * stride_v_h;
                         acc += scores[j] * static_cast<float>(v_row[d]);
                     }
                     o_row[d] = static_cast<bf16_t>(acc);
@@ -211,7 +220,8 @@ int main(int argc, char** argv) {
     int H    = 64;    // query heads
     int H_KV = 8;     // key/value heads
     int N    = 1024;  // sequence length
-    int D    = 128;   // head dimension
+    int D    = 128;   // Q/K head dimension
+    int D_V  = D;     // V/O head dimension
 
     // Parse command line arguments. Supports: -n 16384, -n=16384, --seq=16384
     bool causal = true;
@@ -242,42 +252,45 @@ int main(int argc, char** argv) {
         if (try_parse(H_KV, "--hkv", nullptr)) continue;
         if (try_parse(N, "-n", "--seq")) continue;
         if (try_parse(D, "-d", "--dim")) continue;
+        if (try_parse(D_V, "--dim-v", "--vdim")) continue;
         if (try_parse(verify, "-v", "--verify")) continue;
     }
 
-    if (B <= 0 || H <= 0 || H_KV <= 0 || N <= 0 || D <= 0 || H % H_KV != 0) {
-        std::cerr << "Invalid parameters. B,H,H_KV,N,D must be positive and H must be divisible by H_KV.\n";
+    if (B <= 0 || H <= 0 || H_KV <= 0 || N <= 0 || D <= 0 || D_V <= 0 || H % H_KV != 0) {
+        std::cerr << "Invalid parameters. B,H,H_KV,N,D,D_V must be positive and H must be divisible by H_KV.\n";
         return 1;
     }
 
     const int GROUP_SIZE = H / H_KV;
-    printf("GQA Attention: B=%d, H=%d, H_KV=%d, GROUP_SIZE=%d, N=%d, D=%d, CAUSAL=%d\n",
-           B, H, H_KV, GROUP_SIZE, N, D, causal ? 1 : 0);
+    printf("GQA Attention: B=%d, H=%d, H_KV=%d, GROUP_SIZE=%d, N=%d, D=%d, D_V=%d, CAUSAL=%d\n",
+           B, H, H_KV, GROUP_SIZE, N, D, D_V, causal ? 1 : 0);
 
     // Allocate host memory
     const size_t q_size = (size_t)B * N * H * D;
-    const size_t kv_size = (size_t)B * N * H_KV * D;
+    const size_t k_size = (size_t)B * N * H_KV * D;
+    const size_t v_size = (size_t)B * N * H_KV * D_V;
+    const size_t o_size = (size_t)B * N * H * D_V;
     auto host_q = std::make_unique<bf16_t[]>(q_size);
-    auto host_k = std::make_unique<bf16_t[]>(kv_size);
-    auto host_v = std::make_unique<bf16_t[]>(kv_size);
-    auto host_o_ref = std::make_unique<bf16_t[]>(q_size);
-    auto host_o_gpu = std::make_unique<bf16_t[]>(q_size);
+    auto host_k = std::make_unique<bf16_t[]>(k_size);
+    auto host_v = std::make_unique<bf16_t[]>(v_size);
+    auto host_o_ref = std::make_unique<bf16_t[]>(o_size);
+    auto host_o_gpu = std::make_unique<bf16_t[]>(o_size);
 
     // Initialize with random data
     rand_vector(host_q.get(), q_size, -2.f, 2.f);
-    rand_vector(host_k.get(), kv_size, -2.f, 2.f);
-    rand_vector(host_v.get(), kv_size, -2.f, 2.f);
+    rand_vector(host_k.get(), k_size, -2.f, 2.f);
+    rand_vector(host_v.get(), v_size, -2.f, 2.f);
 
     // Allocate device memory
     bf16_t *dev_q, *dev_k, *dev_v, *dev_o;
     CHECK_HIP(hipMalloc(&dev_q, q_size * sizeof(bf16_t)));
-    CHECK_HIP(hipMalloc(&dev_k, kv_size * sizeof(bf16_t)));
-    CHECK_HIP(hipMalloc(&dev_v, kv_size * sizeof(bf16_t)));
-    CHECK_HIP(hipMalloc(&dev_o, q_size * sizeof(bf16_t)));
+    CHECK_HIP(hipMalloc(&dev_k, k_size * sizeof(bf16_t)));
+    CHECK_HIP(hipMalloc(&dev_v, v_size * sizeof(bf16_t)));
+    CHECK_HIP(hipMalloc(&dev_o, o_size * sizeof(bf16_t)));
 
     CHECK_HIP(hipMemcpy(dev_q, host_q.get(), q_size * sizeof(bf16_t), hipMemcpyHostToDevice));
-    CHECK_HIP(hipMemcpy(dev_k, host_k.get(), kv_size * sizeof(bf16_t), hipMemcpyHostToDevice));
-    CHECK_HIP(hipMemcpy(dev_v, host_v.get(), kv_size * sizeof(bf16_t), hipMemcpyHostToDevice));
+    CHECK_HIP(hipMemcpy(dev_k, host_k.get(), k_size * sizeof(bf16_t), hipMemcpyHostToDevice));
+    CHECK_HIP(hipMemcpy(dev_v, host_v.get(), v_size * sizeof(bf16_t), hipMemcpyHostToDevice));
 
     // Setup kernel arguments
     opus_gqa_kargs kargs{};
@@ -290,17 +303,26 @@ int main(int argc, char** argv) {
     kargs.H = H;
     kargs.H_KV = H_KV;
     kargs.D = D;
+    kargs.D_V = D_V;
     kargs.stride_q_b = N * H * D;
     kargs.stride_q_n = H * D;
     kargs.stride_q_h = D;
-    kargs.stride_kv_b = N * H_KV * D;
-    kargs.stride_kv_n = H_KV * D;
-    kargs.stride_kv_h = D;
+    kargs.stride_k_b = N * H_KV * D;
+    kargs.stride_k_n = H_KV * D;
+    kargs.stride_k_h = D;
+    kargs.stride_v_b = N * H_KV * D_V;
+    kargs.stride_v_n = H_KV * D_V;
+    kargs.stride_v_h = D_V;
+    kargs.stride_o_b = N * H * D_V;
+    kargs.stride_o_n = H * D_V;
+    kargs.stride_o_h = D_V;
 
     // Dispatch to causal or non-causal kernel
     auto run = [&]<typename GqaTraits>(GqaTraits) {
-        if (D != GqaTraits::D_TILE_SIZE) {
-            std::cerr << "This kernel only supports head dimension D=" << GqaTraits::D_TILE_SIZE << ", got D=" << D << "\n";
+        if (D != GqaTraits::D_TILE_SIZE || D_V != GqaTraits::DV_TILE_SIZE) {
+            std::cerr << "This kernel only supports Q/K head dim D=" << GqaTraits::D_TILE_SIZE
+                      << " and V/O head dim D_V=" << GqaTraits::DV_TILE_SIZE
+                      << ", got D=" << D << ", D_V=" << D_V << "\n";
             return 1;
         }
         if ((N % GqaTraits::KV_TILE_SIZE) != 0 || (N / GqaTraits::KV_TILE_SIZE) < 6) {
@@ -327,11 +349,11 @@ int main(int argc, char** argv) {
 
         if (verify) {
             printf("\nValidating GPU results against CPU reference...\n");
-            CHECK_HIP(hipMemcpy(host_o_gpu.get(), dev_o, q_size * sizeof(bf16_t), hipMemcpyDeviceToHost));
+            CHECK_HIP(hipMemcpy(host_o_gpu.get(), dev_o, o_size * sizeof(bf16_t), hipMemcpyDeviceToHost));
             gqa_attention_ref(host_q.get(), host_k.get(), host_v.get(), host_o_ref.get(),
-                              B, N, H, H_KV, D, GqaTraits::CAUSAL);
+                              B, N, H, H_KV, D, D_V, GqaTraits::CAUSAL);
 
-            bool all_valid = validate_gqa_results(host_o_ref.get(), host_o_gpu.get(), B, N, H, D);
+            bool all_valid = validate_gqa_results(host_o_ref.get(), host_o_gpu.get(), B, N, H, D_V);
             printf("\n[Overall] %s\n", all_valid ? "✓ GPU KERNEL VALID" : "✗ GPU KERNEL FAILED");
             if (!all_valid) return 1;
         }
@@ -343,10 +365,27 @@ int main(int argc, char** argv) {
     };
 
     int rc;
-    if (causal)
-        rc = run(opus_gqa_traits<32, 64, 128, 8, true>{});
-    else
-        rc = run(opus_gqa_traits<32, 64, 128, 8, false>{});
+    if (causal) {
+        if (D == 128 && D_V == 128)
+            rc = run(opus_gqa_traits<32, 64, 128, 128, 8, true>{});
+        else if (D == 192 && D_V == 128)
+            rc = run(opus_gqa_traits<32, 64, 192, 128, 8, true>{});
+        else {
+            std::cerr << "Unsupported causal kernel dims: D=" << D << ", D_V=" << D_V
+                      << ". Supported pairs: (128,128), (192,128)\n";
+            return 1;
+        }
+    } else {
+        if (D == 128 && D_V == 128)
+            rc = run(opus_gqa_traits<32, 64, 128, 128, 8, false>{});
+        else if (D == 192 && D_V == 128)
+            rc = run(opus_gqa_traits<32, 64, 192, 128, 8, false>{});
+        else {
+            std::cerr << "Unsupported non-causal kernel dims: D=" << D << ", D_V=" << D_V
+                      << ". Supported pairs: (128,128), (192,128)\n";
+            return 1;
+        }
+    }
     if (rc) return rc;
 
     // Cleanup

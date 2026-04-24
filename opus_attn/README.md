@@ -83,7 +83,7 @@ All flags support both `-n 16384` and `-n=16384` syntax.
 
 ## Kernel configuration
 
-The kernel is parameterized via `opus_gqa_traits<Q_TILE, KV_TILE, D_TILE, NUM_WARPS, CAUSAL>`:
+The kernel is parameterized via `opus_gqa_traits<Q_TILE, KV_TILE, D_TILE, DV_TILE, NUM_WARPS, CAUSAL>`:
 
 | Parameter | Value | Description |
 |-----------|-------|-------------|

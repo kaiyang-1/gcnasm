@@ -7,31 +7,40 @@ using bf16_t = __bf16;
 struct opus_gqa_kargs {
     const void* __restrict__ ptr_q;  // [B, N, H, D]
     const void* __restrict__ ptr_k;  // [B, N, H_KV, D]
-    const void* __restrict__ ptr_v;  // [B, N, H_KV, D]
-    void* __restrict__ ptr_o;        // [B, N, H, D]
+    const void* __restrict__ ptr_v;  // [B, N, H_KV, D_V]
+    void* __restrict__ ptr_o;        // [B, N, H, D_V]
     int B;
     int N;
     int H;
     int H_KV;
-    int D;
+    int D;    // Q/K head dim
+    int D_V;  // V/O head dim
     int stride_q_b;
     int stride_q_n;
     int stride_q_h;
-    int stride_kv_b;
-    int stride_kv_n;
-    int stride_kv_h;
+    int stride_k_b;
+    int stride_k_n;
+    int stride_k_h;
+    int stride_v_b;
+    int stride_v_n;
+    int stride_v_h;
+    int stride_o_b;
+    int stride_o_n;
+    int stride_o_h;
 };
 
 // Configuration traits for GQA kernel (tile sizes, data types, vector lengths, MFMA config)
 template<int Q_TILE_SIZE_ = 32,
         int KV_TILE_SIZE_ = 64,
         int D_TILE_SIZE_ = 128,
+        int DV_TILE_SIZE_ = 128,
         int NUM_WARPS_ = 8,
         bool CAUSAL_ = false>
 struct opus_gqa_traits {
     static constexpr int Q_TILE_SIZE = Q_TILE_SIZE_;
     static constexpr int KV_TILE_SIZE = KV_TILE_SIZE_;
     static constexpr int D_TILE_SIZE = D_TILE_SIZE_;
+    static constexpr int DV_TILE_SIZE = DV_TILE_SIZE_;
     static constexpr int NUM_WARPS = NUM_WARPS_;
     static constexpr bool CAUSAL = CAUSAL_;
 
@@ -57,9 +66,9 @@ struct opus_gqa_traits {
     static constexpr int GEMM0_E_N = KV_TILE_SIZE / W_N;
     static constexpr int GEMM0_E_K = D_TILE_SIZE / W_K;
 
-    // GEMM1: O[Q_TILE x D] = P[Q_TILE x KV_TILE] @ V[KV_TILE x D]
+    // GEMM1: O[Q_TILE x D_V] = P[Q_TILE x KV_TILE] @ V[KV_TILE x D_V]
     static constexpr int GEMM1_E_M = Q_TILE_SIZE / W_M;
-    static constexpr int GEMM1_E_N = D_TILE_SIZE / W_N;
+    static constexpr int GEMM1_E_N = DV_TILE_SIZE / W_N;
     static constexpr int GEMM1_E_K = KV_TILE_SIZE / W_K;
 
     // Vector lengths for global load/store
@@ -70,19 +79,19 @@ struct opus_gqa_traits {
 
     // Minimal compact pixels for async copy for one wave
     static constexpr int D_128B_SIZE = 128 / sizeof(D_ATTN);
-    static_assert(VEC_KV == 16 / sizeof(D_ATTN));
     static constexpr int smem_linear_wave = WARP_SIZE * 16 / sizeof(D_ATTN);
     static constexpr int smem_n_sub = smem_linear_wave / D_128B_SIZE;
     static constexpr int smem_n_rpt = KV_TILE_SIZE / smem_n_sub;
     static constexpr int smem_d_rpt = D_TILE_SIZE / D_128B_SIZE;
+    static constexpr int smem_dv_rpt = DV_TILE_SIZE / D_128B_SIZE;
     static constexpr int smem_padding_16B = 16 / sizeof(D_ATTN);
     static constexpr int smem_padding_64B = 64 / sizeof(D_ATTN);
     static constexpr int smem_k_tile_elems = smem_n_rpt * smem_d_rpt * (smem_linear_wave + smem_padding_16B);
-    static constexpr int smem_v_tile_elems = smem_n_rpt * smem_d_rpt * (smem_linear_wave + smem_padding_64B);
+    static constexpr int smem_v_tile_elems = smem_n_rpt * smem_dv_rpt * (smem_linear_wave + smem_padding_64B);
     static constexpr int smem_buffer_elems = smem_k_tile_elems + smem_v_tile_elems;
 
     static constexpr int k_buffer_load_insts = (KV_TILE_SIZE * D_TILE_SIZE) / (BLOCK_SIZE * VEC_KV);
-    static constexpr int v_buffer_load_insts = (KV_TILE_SIZE * D_TILE_SIZE) / (BLOCK_SIZE * VEC_KV);
+    static constexpr int v_buffer_load_insts = (KV_TILE_SIZE * DV_TILE_SIZE) / (BLOCK_SIZE * VEC_KV);
     static constexpr int k_ds_read_insts = (GEMM0_E_N * GEMM0_E_K * W_N * W_K) / (WARP_SIZE * VEC_KV);
     static constexpr int v_ds_read_insts = (GEMM1_E_N * GEMM1_E_K * W_N * W_K) / (WARP_SIZE * VEC_TR_V);
 

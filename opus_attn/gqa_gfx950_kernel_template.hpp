@@ -72,15 +72,16 @@ __device__ inline auto make_layout_o(int warp_id, int lane_id, int stride_o_n) {
         opus::unfold_p_coord(o_block_dim, opus::tuple{warp_id, lane_id % T::W_M, lane_id / T::W_M}));
 }
 
-// Create layout for loading K matrix from global memory
-template<typename T>
-__device__ inline auto make_layout_gk_gv(int warp_id, int lane_id, int stride_kv_n) {
+// Create layout for loading K/V matrices from global memory
+template<typename T, int D_TILE_SIZE>
+__device__ inline auto make_layout_gk_gv(int warp_id, int lane_id, int stride_k_n) {
     constexpr int threads_d = T::D_128B_SIZE / T::VEC_KV;
     constexpr int threads_n_per_block = T::BLOCK_SIZE / threads_d;
     constexpr int threads_n_per_wave = opus::get_warp_size() / threads_d;
+    constexpr int smem_d_rpt = D_TILE_SIZE / T::D_128B_SIZE;
 
     constexpr auto gk_block_shape = opus::make_tuple(
-        opus::number<T::smem_d_rpt>{},
+        opus::number<smem_d_rpt>{},
         opus::number<T::KV_TILE_SIZE / threads_n_per_block>{},
         opus::number<threads_n_per_wave>{},
         opus::number<T::NUM_WARPS>{},
@@ -94,15 +95,25 @@ __device__ inline auto make_layout_gk_gv(int warp_id, int lane_id, int stride_kv
 
     return opus::make_layout(
         gk_block_shape,
-        opus::unfold_x_stride(gk_block_dim, gk_block_shape, opus::tuple{opus::number<T::D_128B_SIZE>{}, stride_kv_n, 1_I}),
+        opus::unfold_x_stride(gk_block_dim, gk_block_shape, opus::tuple{opus::number<T::D_128B_SIZE>{}, stride_k_n, 1_I}),
         opus::unfold_p_coord(gk_block_dim, opus::tuple{lane_id / threads_d, warp_id, lane_id % threads_d}));
 }
 
-// Create layout for storing K matrix to shared memory
-template<typename T, int smem_padding>
+template<typename T>
+__device__ inline auto make_layout_gk(int warp_id, int lane_id, int stride_k_n) {
+    return make_layout_gk_gv<T, T::D_TILE_SIZE>(warp_id, lane_id, stride_k_n);
+}
+
+template<typename T>
+__device__ inline auto make_layout_gv(int warp_id, int lane_id, int stride_v_n) {
+    return make_layout_gk_gv<T, T::DV_TILE_SIZE>(warp_id, lane_id, stride_v_n);
+}
+
+// Create layout for storing K/V matrices to shared memory
+template<typename T, int smem_padding, int smem_d_rpt>
 __device__ inline auto make_layout_sk_sv(int warp_id) {
     constexpr auto sk_block_shape = opus::make_tuple(
-        opus::number<T::smem_d_rpt>{},
+        opus::number<smem_d_rpt>{},
         opus::number<T::smem_n_rpt / T::NUM_WARPS>{},
         opus::number<T::NUM_WARPS>{},
         opus::number<T::VEC_KV>{});
@@ -115,6 +126,16 @@ __device__ inline auto make_layout_sk_sv(int warp_id) {
         sk_block_shape,
         opus::unfold_x_stride(sk_block_dim, sk_block_shape, opus::tuple{opus::number<T::smem_linear_wave + smem_padding>{}, 1_I}),
         opus::unfold_p_coord(sk_block_dim, opus::tuple{warp_id}));
+}
+
+template<typename T>
+__device__ inline auto make_layout_sk(int warp_id) {
+    return make_layout_sk_sv<T, T::smem_padding_16B, T::smem_d_rpt>(warp_id);
+}
+
+template<typename T>
+__device__ inline auto make_layout_sv(int warp_id) {
+    return make_layout_sk_sv<T, T::smem_padding_64B, T::smem_dv_rpt>(warp_id);
 }
 
 // Create layout for reading K matrix from shared memory to registers
@@ -311,14 +332,16 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gqa_kernel(opus_gqa_kar
     const int h_kv = h / group_size;
     const int q_block_size = T::NUM_WARPS * T::Q_TILE_SIZE;
     const int q_block_start = q_block_idx * q_block_size;
-    const int qo_gmem_offset = b * kargs.stride_q_b + q_block_start * kargs.stride_q_n + h * kargs.stride_q_h;
-    const int kv_gmem_offset = b * kargs.stride_kv_b + h_kv * kargs.stride_kv_h;
+    const int q_gmem_offset = b * kargs.stride_q_b + q_block_start * kargs.stride_q_n + h * kargs.stride_q_h;
+    const int k_gmem_offset = b * kargs.stride_k_b + h_kv * kargs.stride_k_h;
+    const int v_gmem_offset = b * kargs.stride_v_b + h_kv * kargs.stride_v_h;
+    const int o_gmem_offset = b * kargs.stride_o_b + q_block_start * kargs.stride_o_n + h * kargs.stride_o_h;
 
     // Global memory tensors
-    auto g_q = make_gmem(reinterpret_cast<const D_ATTN*>(kargs.ptr_q) + qo_gmem_offset);
-    auto g_k = make_gmem(reinterpret_cast<const D_ATTN*>(kargs.ptr_k) + kv_gmem_offset);
-    auto g_v = make_gmem(reinterpret_cast<const D_ATTN*>(kargs.ptr_v) + kv_gmem_offset);
-    auto g_o = make_gmem(reinterpret_cast<D_ATTN*>(kargs.ptr_o) + qo_gmem_offset);
+    auto g_q = make_gmem(reinterpret_cast<const D_ATTN*>(kargs.ptr_q) + q_gmem_offset);
+    auto g_k = make_gmem(reinterpret_cast<const D_ATTN*>(kargs.ptr_k) + k_gmem_offset);
+    auto g_v = make_gmem(reinterpret_cast<const D_ATTN*>(kargs.ptr_v) + v_gmem_offset);
+    auto g_o = make_gmem(reinterpret_cast<D_ATTN*>(kargs.ptr_o) + o_gmem_offset);
 
     // Shared memory for K and V tiles
     __shared__ char smem_buf[T::smem_size_bytes()];
@@ -346,11 +369,11 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gqa_kernel(opus_gqa_kar
 
     // Partition layouts
     auto u_q  = make_layout_q<T>(warp_id, lane_id, kargs.stride_q_n);
-    auto u_gk = make_layout_gk_gv<T>(warp_id, lane_id, kargs.stride_kv_n);
-    auto u_sk = make_layout_sk_sv<T, T::smem_padding_16B>(warp_id);
+    auto u_gk = make_layout_gk<T>(warp_id, lane_id, kargs.stride_k_n);
+    auto u_sk = make_layout_sk<T>(warp_id);
     auto u_rk = make_layout_rk<T>(lane_id);
-    auto u_gv = make_layout_gk_gv<T>(warp_id, lane_id, kargs.stride_kv_n);
-    auto u_sv = make_layout_sk_sv<T, T::smem_padding_64B>(warp_id);
+    auto u_gv = make_layout_gv<T>(warp_id, lane_id, kargs.stride_v_n);
+    auto u_sv = make_layout_sv<T>(warp_id);
     auto u_rv = make_layout_rv<T>(lane_id);
 
     // Register fragments
@@ -379,7 +402,6 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gqa_kernel(opus_gqa_kar
     D_ACC rescale_m = 1.0f;
 
     // Tile traversal helpers
-    const int kv_tile_stride = T::KV_TILE_SIZE * kargs.stride_kv_n;
     const int num_kv_tiles = ceil_div(kargs.N, T::KV_TILE_SIZE);
     int max_num_tiles = num_kv_tiles;
     if constexpr (T::CAUSAL) {
@@ -387,14 +409,15 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gqa_kernel(opus_gqa_kar
         const int causal_num_tiles = ceil_div(q_block_end, T::KV_TILE_SIZE);
         max_num_tiles = causal_num_tiles < max_num_tiles ? causal_num_tiles : max_num_tiles;
     }
-    auto kv_tile = [&](int tile_idx) { return tile_idx * kv_tile_stride; };
+    auto k_tile = [&](int tile_idx) { return tile_idx * T::KV_TILE_SIZE * kargs.stride_k_n; };
+    auto v_tile = [&](int tile_idx) { return tile_idx * T::KV_TILE_SIZE * kargs.stride_v_n; };
 
     // Causal masking helpers
     [[maybe_unused]] const int q_start_pos = q_block_start + warp_id * T::Q_TILE_SIZE;
     [[maybe_unused]] const opus::u32_t neg_inf_v = std::bit_cast<opus::u32_t>(-opus::numeric_limits<D_ACC>::infinity());
 
     // Prologue
-    async_load<T::VEC_KV>(g_k, s_k[0].ptr, u_gk, u_sk, kv_tile(0));
+    async_load<T::VEC_KV>(g_k, s_k[0].ptr, u_gk, u_sk, k_tile(0));
     __builtin_amdgcn_s_waitcnt(0);
     __builtin_amdgcn_sched_barrier(0);
     __builtin_amdgcn_s_barrier();
@@ -404,8 +427,8 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gqa_kernel(opus_gqa_kar
     static_for<q_len>([&](auto i) { v_q_f32[i.value] *= temperature_scale; });
     v_q = opus::cast<D_ATTN>(v_q_f32);
 
-    async_load<T::VEC_KV>(g_k, s_k[1].ptr, u_gk, u_sk, kv_tile(1));
-    async_load<T::VEC_KV>(g_v, s_v[0].ptr, u_gv, u_sv, kv_tile(0));
+    async_load<T::VEC_KV>(g_k, s_k[1].ptr, u_gk, u_sk, k_tile(1));
+    async_load<T::VEC_KV>(g_v, s_v[0].ptr, u_gv, u_sv, v_tile(0));
     v_k = load<T::VEC_KV>(s_k[0], u_rk);
     __builtin_amdgcn_sched_barrier(0);
     s_waitcnt_lgkmcnt(0_I);
@@ -432,12 +455,12 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gqa_kernel(opus_gqa_kar
     __builtin_amdgcn_s_barrier();
     __builtin_amdgcn_sched_barrier(0);
 
-    async_load<T::VEC_KV>(g_k, s_k[0].ptr, u_gk, u_sk, kv_tile(2));
+    async_load<T::VEC_KV>(g_k, s_k[0].ptr, u_gk, u_sk, k_tile(2));
 
     // Main loop
     for (int j = 3; j < max_num_tiles - 1; j += 2) {
         // Cluster 0:
-        async_load<T::VEC_KV>(g_v, s_v[1].ptr, u_gv, u_sv, kv_tile(j - 2));
+        async_load<T::VEC_KV>(g_v, s_v[1].ptr, u_gv, u_sv, v_tile(j - 2));
         v_k = load<T::VEC_KV>(s_k[1], u_rk);
         s_waitcnt_lgkmcnt(0_I);
         s_waitcnt_vmcnt(number<T::k_buffer_load_insts + T::v_buffer_load_insts>{});
@@ -458,7 +481,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gqa_kernel(opus_gqa_kar
         __builtin_amdgcn_sched_barrier(0);
 
         // Cluster 2:
-        async_load<T::VEC_KV>(g_k, s_k[1].ptr, u_gk, u_sk, kv_tile(j));
+        async_load<T::VEC_KV>(g_k, s_k[1].ptr, u_gk, u_sk, k_tile(j));
         v_v = tr_load<T::VEC_TR_V>(s_v[0], u_rv);
         s_waitcnt_lgkmcnt(0_I);
         s_waitcnt_vmcnt(number<T::k_buffer_load_insts + T::v_buffer_load_insts>{});
@@ -495,7 +518,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gqa_kernel(opus_gqa_kar
         __builtin_amdgcn_sched_barrier(0);
 
         // Cluster 4:
-        async_load<T::VEC_KV>(g_v, s_v[0].ptr, u_gv, u_sv, kv_tile(j - 1));
+        async_load<T::VEC_KV>(g_v, s_v[0].ptr, u_gv, u_sv, v_tile(j - 1));
         v_k = load<T::VEC_KV>(s_k[0], u_rk);
         s_waitcnt_lgkmcnt(0_I);
         s_waitcnt_vmcnt(number<T::k_buffer_load_insts + T::v_buffer_load_insts>{});
@@ -516,7 +539,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gqa_kernel(opus_gqa_kar
         __builtin_amdgcn_sched_barrier(0);
 
         // Cluster 6:
-        async_load<T::VEC_KV>(g_k, s_k[0].ptr, u_gk, u_sk, kv_tile(j + 1));
+        async_load<T::VEC_KV>(g_k, s_k[0].ptr, u_gk, u_sk, k_tile(j + 1));
         v_v = tr_load<T::VEC_TR_V>(s_v[1], u_rv);
         if constexpr (T::CAUSAL) {
             const int kv_end_pos = j * T::KV_TILE_SIZE;
@@ -561,7 +584,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gqa_kernel(opus_gqa_kar
 
     // Epilogue
     // Cluster 0:
-    async_load<T::VEC_KV>(g_v, s_v[1].ptr, u_gv, u_sv, kv_tile(max_num_tiles - 3));
+    async_load<T::VEC_KV>(g_v, s_v[1].ptr, u_gv, u_sv, v_tile(max_num_tiles - 3));
     v_k = load<T::VEC_KV>(s_k[1], u_rk);
     s_waitcnt_lgkmcnt(0_I);
     s_waitcnt_vmcnt(number<T::k_buffer_load_insts + T::v_buffer_load_insts>{});
@@ -582,7 +605,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gqa_kernel(opus_gqa_kar
     __builtin_amdgcn_sched_barrier(0);
 
     // Cluster 2:
-    async_load<T::VEC_KV>(g_k, s_k[1].ptr, u_gk, u_sk, kv_tile(max_num_tiles - 1));
+    async_load<T::VEC_KV>(g_k, s_k[1].ptr, u_gk, u_sk, k_tile(max_num_tiles - 1));
     v_v = tr_load<T::VEC_TR_V>(s_v[0], u_rv);
     if constexpr (T::CAUSAL) {
         const int kv_end_pos = (max_num_tiles - 2) * T::KV_TILE_SIZE;
@@ -617,7 +640,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gqa_kernel(opus_gqa_kar
     __builtin_amdgcn_sched_barrier(0);
 
     // Cluster 4:
-    async_load<T::VEC_KV>(g_v, s_v[0].ptr, u_gv, u_sv, kv_tile(max_num_tiles - 2));
+    async_load<T::VEC_KV>(g_v, s_v[0].ptr, u_gv, u_sv, v_tile(max_num_tiles - 2));
     v_k = load<T::VEC_KV>(s_k[0], u_rk);
     s_waitcnt_lgkmcnt(0_I);
     s_waitcnt_vmcnt(number<T::k_buffer_load_insts + T::v_buffer_load_insts>{});
@@ -672,7 +695,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gqa_kernel(opus_gqa_kar
     __builtin_amdgcn_sched_barrier(0);
 
     // Cluster 8:
-    async_load<T::VEC_KV>(g_v, s_v[1].ptr, u_gv, u_sv, kv_tile(max_num_tiles - 1));
+    async_load<T::VEC_KV>(g_v, s_v[1].ptr, u_gv, u_sv, v_tile(max_num_tiles - 1));
     v_k = load<T::VEC_KV>(s_k[1], u_rk);
     s_waitcnt_lgkmcnt(0_I);
     s_waitcnt_vmcnt(number<T::v_buffer_load_insts>{});
@@ -748,7 +771,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gqa_kernel(opus_gqa_kar
         __builtin_amdgcn_s_barrier();
     }
 
-    auto u_o = make_layout_o<T>(warp_id, lane_id, kargs.stride_q_n);
+    auto u_o = make_layout_o<T>(warp_id, lane_id, kargs.stride_o_n);
     auto v_o_bf16 = opus::cast<D_ATTN>(v_o);
     store<T::VEC_O>(g_o, v_o_bf16, u_o);
 }
