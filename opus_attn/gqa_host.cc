@@ -9,11 +9,14 @@
 #include <cassert>
 #include <omp.h>
 
-#include "gqa_common.h"
+#include "gqa_defs.h"
 
-// Declared in gqa_gfx950_kernel.cc (device TU)
+// Declared in device TUs.
 template<class Traits>
-__global__ void gqa_kernel(opus_gqa_kargs kargs);
+__global__ void gqa_d128_kernel(opus_gqa_kargs kargs);
+
+template<class Traits>
+__global__ void gqa_d192_dv128_kernel(opus_gqa_kargs kargs);
 
 #define CHECK_HIP(call)                                                                                   \
     do {                                                                                                  \
@@ -44,9 +47,10 @@ void rand_vector(T* ptr, size_t size, float min_val = 0.0f, float max_val = 1.0f
 // Benchmark GQA kernel performance with warm-up and timing
 template<class Traits>
 void benchmark_gqa_kernel(const opus_gqa_kargs& kargs, dim3 grid, dim3 block,
+                          auto launch_kernel,
                           int warmup = 100, int iterations = 50) {
     for (int i = 0; i < warmup; ++i) {
-        gqa_kernel<Traits><<<grid, block>>>(kargs);
+        launch_kernel.template operator()<Traits>(grid, block, kargs);
         CHECK_HIP_KERNEL_LAUNCH();
     }
     CHECK_HIP(hipDeviceSynchronize());
@@ -57,7 +61,7 @@ void benchmark_gqa_kernel(const opus_gqa_kargs& kargs, dim3 grid, dim3 block,
 
     CHECK_HIP(hipEventRecord(start));
     for (int i = 0; i < iterations; ++i) {
-        gqa_kernel<Traits><<<grid, block>>>(kargs);
+        launch_kernel.template operator()<Traits>(grid, block, kargs);
         CHECK_HIP_KERNEL_LAUNCH();
     }
     CHECK_HIP(hipEventRecord(stop));
@@ -223,9 +227,9 @@ int main(int argc, char** argv) {
     int D    = 128;   // Q/K head dimension
     int D_V  = D;     // V/O head dimension
 
-    // Parse command line arguments. Supports: -n 16384, -n=16384, --seq=16384
+    // Parse command line arguments
     bool causal = true;
-    int verify = 0;
+    bool verify = false;
     auto parse_val = [](const char* arg, const char* flag) -> const char* {
         size_t len = std::strlen(flag);
         if (std::strncmp(arg, flag, len) == 0) {
@@ -239,6 +243,7 @@ int main(int argc, char** argv) {
         const char* val;
         if (std::strcmp(arg, "--causal") == 0) { causal = true; continue; }
         if (std::strcmp(arg, "--no-causal") == 0) { causal = false; continue; }
+        if (std::strcmp(arg, "--verify") == 0) { verify = true; continue; }
         auto try_parse = [&](int& target, const char* s, const char* l) {
             if ((val = parse_val(arg, s)) || (l && (val = parse_val(arg, l)))) {
                 if (val == reinterpret_cast<const char*>(1)) { if (i + 1 < argc) target = std::atoi(argv[++i]); }
@@ -247,13 +252,12 @@ int main(int argc, char** argv) {
             }
             return false;
         };
-        if (try_parse(B, "-b", "--batch")) continue;
-        if (try_parse(H, "-h", "--heads")) continue;
-        if (try_parse(H_KV, "--hkv", nullptr)) continue;
-        if (try_parse(N, "-n", "--seq")) continue;
-        if (try_parse(D, "-d", "--dim")) continue;
-        if (try_parse(D_V, "--dim-v", "--vdim")) continue;
-        if (try_parse(verify, "-v", "--verify")) continue;
+        if (try_parse(B, "-b", nullptr)) continue;
+        if (try_parse(H, "-h_q", nullptr)) continue;
+        if (try_parse(H_KV, "-h_kv", nullptr)) continue;
+        if (try_parse(N, "-n", nullptr)) continue;
+        if (try_parse(D, "-d", nullptr)) continue;
+        if (try_parse(D_V, "-dv", nullptr)) continue;
     }
 
     if (B <= 0 || H <= 0 || H_KV <= 0 || N <= 0 || D <= 0 || D_V <= 0 || H % H_KV != 0) {
@@ -318,7 +322,13 @@ int main(int argc, char** argv) {
     kargs.stride_o_h = D_V;
 
     // Dispatch to causal or non-causal kernel
-    auto run = [&]<typename GqaTraits>(GqaTraits) {
+    auto launch_default = [&]<typename GqaTraits>(dim3 grid, dim3 block, const opus_gqa_kargs& args) {
+        gqa_d128_kernel<GqaTraits><<<grid, block>>>(args);
+    };
+    auto launch_d192_dv128 = [&]<typename GqaTraits>(dim3 grid, dim3 block, const opus_gqa_kargs& args) {
+        gqa_d192_dv128_kernel<GqaTraits><<<grid, block>>>(args);
+    };
+    auto run = [&]<typename GqaTraits>(GqaTraits, auto launch_kernel) {
         if (D != GqaTraits::D_TILE_SIZE || D_V != GqaTraits::DV_TILE_SIZE) {
             std::cerr << "This kernel only supports Q/K head dim D=" << GqaTraits::D_TILE_SIZE
                       << " and V/O head dim D_V=" << GqaTraits::DV_TILE_SIZE
@@ -338,13 +348,13 @@ int main(int argc, char** argv) {
         }
         const int num_q_tiles = ceil_div(N, GqaTraits::Q_TILE_SIZE);
         const int num_q_blocks = ceil_div(num_q_tiles, GqaTraits::NUM_WARPS);
-        dim3 grid(H, num_q_blocks, B);
+        dim3 grid(H, num_q_blocks, B); 
         dim3 block(GqaTraits::BLOCK_SIZE);
 
         printf("GQA kernel launch config: grid=(%d,%d,%d), block=%d (NUM_WARPS=%d), smem=%zu bytes (K/V tiles)\n",
                grid.x, grid.y, grid.z, (int)block.x, GqaTraits::NUM_WARPS, GqaTraits::smem_size_bytes());
 
-        gqa_kernel<GqaTraits><<<grid, block>>>(kargs);
+        launch_kernel.template operator()<GqaTraits>(grid, block, kargs);
         CHECK_HIP_KERNEL_LAUNCH();
 
         if (verify) {
@@ -359,7 +369,7 @@ int main(int argc, char** argv) {
         }
 
         printf("\n");
-        benchmark_gqa_kernel<GqaTraits>(kargs, grid, block);
+        benchmark_gqa_kernel<GqaTraits>(kargs, grid, block, launch_kernel);
         printf("\n");
         return 0;
     };
@@ -367,9 +377,9 @@ int main(int argc, char** argv) {
     int rc;
     if (causal) {
         if (D == 128 && D_V == 128)
-            rc = run(opus_gqa_traits<32, 64, 128, 128, 8, true>{});
+            rc = run(opus_gqa_traits<32, 64, 128, 128, 8, true>{}, launch_default);
         else if (D == 192 && D_V == 128)
-            rc = run(opus_gqa_traits<32, 64, 192, 128, 8, true>{});
+            rc = run(opus_gqa_traits<32, 64, 192, 128, 8, true>{}, launch_d192_dv128);
         else {
             std::cerr << "Unsupported causal kernel dims: D=" << D << ", D_V=" << D_V
                       << ". Supported pairs: (128,128), (192,128)\n";
@@ -377,9 +387,9 @@ int main(int argc, char** argv) {
         }
     } else {
         if (D == 128 && D_V == 128)
-            rc = run(opus_gqa_traits<32, 64, 128, 128, 8, false>{});
+            rc = run(opus_gqa_traits<32, 64, 128, 128, 8, false>{}, launch_default);
         else if (D == 192 && D_V == 128)
-            rc = run(opus_gqa_traits<32, 64, 192, 128, 8, false>{});
+            rc = run(opus_gqa_traits<32, 64, 192, 128, 8, false>{}, launch_d192_dv128);
         else {
             std::cerr << "Unsupported non-causal kernel dims: D=" << D << ", D_V=" << D_V
                       << ". Supported pairs: (128,128), (192,128)\n";

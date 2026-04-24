@@ -7,10 +7,20 @@ COMMON_FLAGS = -I. -I$(OPUS_INCLUDE_DIR) -std=c++20 -fopenmp -O3 -Wall --offload
 BUILD = build
 OUT   = $(BUILD)/gqa_attn.exe
 
-KERNEL_SRCS = gqa_gfx950_kernel_causal.cc gqa_gfx950_kernel_noncausal.cc
-HOST_SRC    = gqa_gfx950_host.cc
+D128_KERNEL_SRCS = \
+	gqa_d128_causal_kernel.cc \
+	gqa_d128_noncausal_kernel.cc
+
+D192_DV128_KERNEL_SRCS = \
+	gqa_d192_dv128_causal_kernel.cc \
+	gqa_d192_dv128_noncausal_kernel.cc
+
+KERNEL_SRCS = $(D128_KERNEL_SRCS) $(D192_DV128_KERNEL_SRCS)
+HOST_SRC    = gqa_host.cc
 KERNEL_OBJS = $(patsubst %.cc,$(BUILD)/%.o,$(KERNEL_SRCS))
 HOST_OBJ    = $(BUILD)/gqa_host.o
+KERNEL_COMMON_DEPS = gqa_device_helpers.hpp gqa_defs.h
+KERNEL_COMPILE_CMD = $(HIPCC) $< $(COMMON_FLAGS) -D__HIPCC_RTC__ -Rpass-analysis=kernel-resource-usage -c -o $@
 
 .PHONY: all clean benchmark
 
@@ -21,11 +31,14 @@ $(BUILD):
 
 # Kernel objects (heavy — device+host passes, parallelizable via make -j)
 # -D__HIPCC_RTC__ skips implicit __clang_hip_runtime_wrapper.h on host pass (~250ms saved)
-$(BUILD)/%.o: %.cc gqa_gfx950_kernel_template.hpp gqa_common.h | $(BUILD)
-	$(HIPCC) $< $(COMMON_FLAGS) -D__HIPCC_RTC__ -Rpass-analysis=kernel-resource-usage -c -o $@
+$(patsubst %.cc,$(BUILD)/%.o,$(D128_KERNEL_SRCS)): $(BUILD)/%.o: %.cc gqa_d128_kernel_template.hpp $(KERNEL_COMMON_DEPS) | $(BUILD)
+	$(KERNEL_COMPILE_CMD)
+
+$(patsubst %.cc,$(BUILD)/%.o,$(D192_DV128_KERNEL_SRCS)): $(BUILD)/%.o: %.cc gqa_d192_dv128_kernel_template.hpp $(KERNEL_COMMON_DEPS) | $(BUILD)
+	$(KERNEL_COMPILE_CMD)
 
 # Host object (no -D__HIPCC_RTC__ — needs full HIP runtime for <<<>>> syntax)
-$(HOST_OBJ): $(HOST_SRC) gqa_common.h | $(BUILD)
+$(HOST_OBJ): $(HOST_SRC) gqa_defs.h | $(BUILD)
 	$(HIPCC) $< $(COMMON_FLAGS) -c -o $@
 
 # Link
