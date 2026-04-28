@@ -18,11 +18,11 @@ Hand-written Grouped-Query Attention (GQA) kernel using the [OPUS](https://githu
 opus_attn/
 ├── Makefile                              # Parallel build (make -j)
 ├── rebuild.sh                            # Build + benchmark both variants
-├── gqa_common.h                          # Shared types: bf16_t, opus_gqa_kargs, opus_gqa_traits
-├── gqa_gfx950_kernel_template.hpp        # Kernel implementation (included by variant .cc files)
-├── gqa_gfx950_kernel_causal.cc           # Causal kernel instantiation
-├── gqa_gfx950_kernel_noncausal.cc        # Non-causal kernel instantiation
-├── gqa_gfx950_host.cc                    # Host launcher, benchmark, validation, main()
+├── gqa_defs.h                            # Shared types: bf16_t, opus_gqa_kargs, opus_gqa_traits
+├── gqa_kernel_template.hpp               # Kernel implementation (included by variant .cc files)
+├── gqa_kernel_causal.cc                  # Causal kernel instantiation
+├── gqa_kernel_noncausal.cc               # Non-causal kernel instantiation
+├── gqa_host.cc                           # Host launcher, benchmark, validation, main()
 ├── hip_minimal.h                         # Local HIP minimal header
 └── monolithic/                           # Original single-file build (for reference)
     ├── gqa_gfx950.cc
@@ -70,16 +70,17 @@ cd monolithic
 
 | Flag | Description | Default |
 |------|-------------|---------|
-| `-b`, `--batch` | Batch size | 16 |
-| `-h`, `--heads` | Number of query heads | 64 |
-| `--hkv` | Number of KV heads | 8 |
-| `-n`, `--seq` | Sequence length | 1024 |
-| `-d`, `--dim` | Head dimension (must be 128) | 128 |
+| `-b` | Batch size | 16 |
+| `-h_q` | Number of query heads | 64 |
+| `-h_kv` | Number of KV heads | 8 |
+| `-n` | Sequence length | 1024 |
+| `-d` | Head dimension (must be 512) | 512 |
 | `--causal` | Enable causal masking | (default) |
 | `--no-causal` | Disable causal masking | |
-| `-v`, `--verify` | CPU reference verification (0=off, 1=on) | 0 |
+| `--verify` | Enable CPU reference verification | off |
+| `--no-verify` | Disable CPU reference verification | (default) |
 
-All flags support both `-n 16384` and `-n=16384` syntax.
+Numeric flags support both `-n 16384` and `-n=16384` syntax.
 
 ## Kernel configuration
 
@@ -89,11 +90,11 @@ The kernel is parameterized via `opus_gqa_traits<Q_TILE, KV_TILE, D_TILE, NUM_WA
 |-----------|-------|-------------|
 | Q_TILE_SIZE | 32 | Query tile size per warp |
 | KV_TILE_SIZE | 64 | KV tile size in shared memory |
-| D_TILE_SIZE | 128 | Head dimension (fixed) |
+| D_TILE_SIZE | 512 | Head dimension (fixed) |
 | NUM_WARPS | 8 | Warps per workgroup (512 threads) |
 | CAUSAL | `true`/`false` | Causal masking (two separate kernel binaries) |
 | MFMA | 32x32x16 bf16 | Matrix multiply instruction |
-| Shared memory | 68096 bytes | Double-buffered K + V tiles |
+| Shared memory | 272384 bytes | Double-buffered K + V tiles |
 
 ## Compile time
 
@@ -115,14 +116,14 @@ Measured on MI355X with ROCm 7.1.1 and [optimized opus.hpp](https://github.com/R
 
 | File | Time | VGPRs | SGPRs | Spill | Occ |
 |------|:----:|:-----:|:-----:|:-----:|:---:|
-| `gqa_gfx950_kernel_causal.cc` | ~1.3s | 236 | 50 | 0 | 2 |
-| `gqa_gfx950_kernel_noncausal.cc` | ~1.3s | 232 | 44 | 0 | 2 |
-| `gqa_gfx950_host.cc` | ~0.9s | — | — | — | — |
+| `gqa_kernel_causal.cc` | ~1.3s | 236 | 50 | 0 | 2 |
+| `gqa_kernel_noncausal.cc` | ~1.3s | 232 | 44 | 0 | 2 |
+| `gqa_host.cc` | ~0.9s | — | — | — | — |
 | Link | ~0.03s | — | — | — | — |
 
 ## Performance
 
-B=16, H=64, H_KV=8, D=128, measured on MI355X:
+Historical D=128 results, measured on MI355X. Rerun benchmarks after the D=512 change before using these numbers:
 
 | N | Causal TFlops | Causal Time | Non-causal TFlops | Non-causal Time |
 |---:|---:|---:|---:|---:|

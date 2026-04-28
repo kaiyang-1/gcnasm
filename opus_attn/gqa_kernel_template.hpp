@@ -3,7 +3,7 @@
 #pragma once
 
 #include <opus/opus.hpp>
-#include "gqa_common.h"
+#include "gqa_defs.h"
 #include <bit>
 #include <cstdint>
 

@@ -9,9 +9,9 @@
 #include <cassert>
 #include <omp.h>
 
-#include "gqa_common.h"
+#include "gqa_defs.h"
 
-// Declared in gqa_gfx950_kernel.cc (device TU)
+// Declared in gqa_kernel_*.cc (device TUs)
 template<class Traits>
 __global__ void gqa_kernel(opus_gqa_kargs kargs);
 
@@ -211,16 +211,16 @@ int main(int argc, char** argv) {
     int H    = 64;    // query heads
     int H_KV = 8;     // key/value heads
     int N    = 1024;  // sequence length
-    int D    = 128;   // head dimension
+    int D    = 512;   // head dimension
 
-    // Parse command line arguments. Supports: -n 16384, -n=16384, --seq=16384
+    // Parse command line arguments. Supports: -n 16384 and -n=16384.
     bool causal = true;
-    int verify = 0;
+    bool verify = false;
     auto parse_val = [](const char* arg, const char* flag) -> const char* {
         size_t len = std::strlen(flag);
         if (std::strncmp(arg, flag, len) == 0) {
-            if (arg[len] == '=') return arg + len + 1;       // --flag=value
-            if (arg[len] == '\0') return reinterpret_cast<const char*>(1); // --flag value (next arg)
+            if (arg[len] == '=') return arg + len + 1;       // -flag=value
+            if (arg[len] == '\0') return reinterpret_cast<const char*>(1); // -flag value (next arg)
         }
         return nullptr;
     };
@@ -229,29 +229,29 @@ int main(int argc, char** argv) {
         const char* val;
         if (std::strcmp(arg, "--causal") == 0) { causal = true; continue; }
         if (std::strcmp(arg, "--no-causal") == 0) { causal = false; continue; }
-        auto try_parse = [&](int& target, const char* s, const char* l) {
-            if ((val = parse_val(arg, s)) || (l && (val = parse_val(arg, l)))) {
+        if (std::strcmp(arg, "--verify") == 0) { verify = true; continue; }
+        auto try_parse = [&](int& target, const char* flag) {
+            if ((val = parse_val(arg, flag))) {
                 if (val == reinterpret_cast<const char*>(1)) { if (i + 1 < argc) target = std::atoi(argv[++i]); }
                 else target = std::atoi(val);
                 return true;
             }
             return false;
         };
-        if (try_parse(B, "-b", "--batch")) continue;
-        if (try_parse(H, "-h", "--heads")) continue;
-        if (try_parse(H_KV, "--hkv", nullptr)) continue;
-        if (try_parse(N, "-n", "--seq")) continue;
-        if (try_parse(D, "-d", "--dim")) continue;
-        if (try_parse(verify, "-v", "--verify")) continue;
+        if (try_parse(B, "-b")) continue;
+        if (try_parse(H, "-h_q")) continue;
+        if (try_parse(H_KV, "-h_kv")) continue;
+        if (try_parse(N, "-n")) continue;
+        if (try_parse(D, "-d")) continue;
     }
 
     if (B <= 0 || H <= 0 || H_KV <= 0 || N <= 0 || D <= 0 || H % H_KV != 0) {
-        std::cerr << "Invalid parameters. B,H,H_KV,N,D must be positive and H must be divisible by H_KV.\n";
+        std::cerr << "Invalid parameters. B,H_Q,H_KV,N,D must be positive and H_Q must be divisible by H_KV.\n";
         return 1;
     }
 
     const int GROUP_SIZE = H / H_KV;
-    printf("GQA Attention: B=%d, H=%d, H_KV=%d, GROUP_SIZE=%d, N=%d, D=%d, CAUSAL=%d\n",
+    printf("GQA Attention: B=%d, H_Q=%d, H_KV=%d, GROUP_SIZE=%d, N=%d, D=%d, CAUSAL=%d\n",
            B, H, H_KV, GROUP_SIZE, N, D, causal ? 1 : 0);
 
     // Allocate host memory
@@ -344,9 +344,9 @@ int main(int argc, char** argv) {
 
     int rc;
     if (causal)
-        rc = run(opus_gqa_traits<32, 64, 128, 8, true>{});
+        rc = run(opus_gqa_traits<32, 64, 512, 8, true>{});
     else
-        rc = run(opus_gqa_traits<32, 64, 128, 8, false>{});
+        rc = run(opus_gqa_traits<32, 64, 512, 8, false>{});
     if (rc) return rc;
 
     // Cleanup

@@ -25,7 +25,7 @@ struct opus_gqa_kargs {
 // Configuration traits for GQA kernel (tile sizes, data types, vector lengths, MFMA config)
 template<int Q_TILE_SIZE_ = 32,
         int KV_TILE_SIZE_ = 64,
-        int D_TILE_SIZE_ = 128,
+        int D_TILE_SIZE_ = 512,
         int NUM_WARPS_ = 8,
         bool CAUSAL_ = false>
 struct opus_gqa_traits {
