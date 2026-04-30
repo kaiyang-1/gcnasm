@@ -11,25 +11,34 @@ using opus::operator""_I;
 
 constexpr int MFMA_MASK    = 0x08;
 constexpr int VALU_MASK    = 0x02;
+constexpr int SALU_MASK    = 0x04;
 constexpr int EXP_MASK     = 0x400;
 constexpr int DS_READ_MASK = 0x100;
 
 #define SCHED_BARRIER(mask, cnt, group) __builtin_amdgcn_sched_group_barrier(mask, cnt, group)
 
-template<int Pairs, int DS_READ_CNT, int VALU_CNT, int Group>
-__device__ inline void sched_barrier_pairs() {
-    SCHED_BARRIER(MFMA_MASK, 1, Group);
-    SCHED_BARRIER(DS_READ_MASK, DS_READ_CNT, Group);
-    SCHED_BARRIER(VALU_MASK, VALU_CNT, Group);
-    if constexpr (Pairs > 1) sched_barrier_pairs<Pairs - 1, DS_READ_CNT, VALU_CNT, Group>();
-}
-
-template<int Pairs, int DS_READ_CNT, int EXP_CNT, int Group>
-__device__ inline void sched_barrier_exp_pairs() {
-    SCHED_BARRIER(MFMA_MASK, 1, Group);
-    SCHED_BARRIER(DS_READ_MASK, DS_READ_CNT, Group);
-    SCHED_BARRIER(EXP_MASK, EXP_CNT, Group);
-    if constexpr (Pairs > 1) sched_barrier_exp_pairs<Pairs - 1, DS_READ_CNT, EXP_CNT, Group>();
+template<int Group>
+__device__ inline void sched_compute_qk() {
+    opus::static_for<4>([&](auto) {
+        SCHED_BARRIER(MFMA_MASK, 1, Group);
+        SCHED_BARRIER(DS_READ_MASK, 1, Group);
+        SCHED_BARRIER(EXP_MASK, 1, Group);
+        SCHED_BARRIER(MFMA_MASK, 1, Group);
+        SCHED_BARRIER(DS_READ_MASK, 1, Group);
+        SCHED_BARRIER(SALU_MASK, 1, Group);
+    });
+    opus::static_for<10>([&](auto) {
+        SCHED_BARRIER(MFMA_MASK, 1, Group);
+        SCHED_BARRIER(DS_READ_MASK, 1, Group);
+        SCHED_BARRIER(MFMA_MASK, 1, Group);
+        SCHED_BARRIER(DS_READ_MASK, 1, Group);
+        SCHED_BARRIER(VALU_MASK, 1, Group);
+        SCHED_BARRIER(SALU_MASK, 1, Group);
+    });
+    opus::static_for<4>([&](auto) {
+        SCHED_BARRIER(MFMA_MASK, 1, Group);
+        SCHED_BARRIER(VALU_MASK, 2, Group);
+    });
 }
 
 // Create layout for loading Q matrix from global memory
@@ -236,6 +245,18 @@ __device__ inline void scale_output_tile(V& v_o, typename T::D_ACC scale) {
     opus::static_for<o_len>([&](auto i) { v_o[i.value] *= scale;});
 }
 
+template<typename V>
+__device__ inline void pin_output_tile(V& v_o) {
+    using chunk_t = opus::vector_t<float, 8>;
+    constexpr int num_chunks = opus::vector_traits<V>::size() / opus::vector_traits<chunk_t>::size();
+    static_assert(opus::vector_traits<V>::size() % opus::vector_traits<chunk_t>::size() == 0);
+    auto* chunks = reinterpret_cast<chunk_t*>(&v_o);
+    #pragma unroll
+    for (int i = 0; i < num_chunks; i++) {
+        asm volatile("" : "+v"(chunks[i]) ::);
+    }
+}
+
 template<int THR_X, int THR_Y>
 __device__ inline void attn_mask_vec2_imm(opus::u32_t rel_vgpr, opus::u32_t neg_inf_vgpr,
                                           opus::u32_t& x_ref, opus::u32_t& y_ref) {
@@ -358,10 +379,10 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gqa_kernel(opus_gqa_kar
     auto u_rv = make_layout_rv<T>(lane_id);
 
     // Register fragments
-    typename decltype(mma0)::vtype_b v_k[T::NUM_D_SLICES];
+    typename decltype(mma0)::vtype_b v_k[2];
     typename decltype(mma0)::vtype_c v_s[2];
     typename decltype(mma1)::vtype_a v_p;
-    typename decltype(mma1)::vtype_b v_v[T::NUM_D_SLICES];
+    typename decltype(mma1)::vtype_b v_v[2];
     vector_t<D_ATTN, T::Q_TILE_SIZE * T::D_TILE_SIZE / T::WARP_SIZE> v_q;
     vector_t<D_ACC,  T::Q_TILE_SIZE * T::D_TILE_SIZE / T::WARP_SIZE> v_o;
     auto v_q_slices = reinterpret_cast<vector_t<D_ATTN, T::Q_TILE_SIZE * T::SLICE_D / T::WARP_SIZE>*>(&v_q);
@@ -388,19 +409,25 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gqa_kernel(opus_gqa_kar
     const int kv_tile_stride = T::KV_TILE_SIZE * kargs.stride_kv_n;
     const int num_kv_tiles = ceil_div(kargs.N, T::KV_TILE_SIZE);
     int max_num_tiles = num_kv_tiles;
+    if constexpr (T::CAUSAL) {
+        const int q_block_end = q_block_start + q_block_size;
+        const int causal_num_tiles = ceil_div(q_block_end, T::KV_TILE_SIZE);
+        max_num_tiles = causal_num_tiles < max_num_tiles ? causal_num_tiles : max_num_tiles;
+    }
     auto kv_tile = [&](int tile_idx) { return tile_idx * kv_tile_stride; };
     auto skv_slice = [](auto slice_idx) {
         constexpr int s = decltype(slice_idx)::value;
         return opus::number<(s / 2) * T::smem_n_rpt * (T::smem_linear_wave + T::smem_padding_32B) + (s % 2) * T::SLICE_D>{};
     };
 
-    auto compute_qk = [&](auto& v_s_acc, auto& s_k_buf) {
-        clear(v_s_acc);
+    auto compute_qk = [&](auto& s, const auto& q, auto& k, auto& sk) {
+        clear(s);
         static_for<T::NUM_D_SLICES>([&](auto i) {
             constexpr int idx = i.value;
-            v_s_acc = mma0(v_q_slices[idx], v_k[idx], v_s_acc);
+            constexpr int slot = idx & 1;
+            s = mma0(q[idx], k[slot], s);
             if constexpr (idx + 2 < T::NUM_D_SLICES) {
-                v_k[idx + 2] = load<T::VEC_KV>(s_k_buf, u_rk + skv_slice(number<idx + 2>{}));
+                k[slot] = load<T::VEC_KV>(sk, u_rk + skv_slice(number<idx + 2>{}));
                 s_waitcnt_lgkmcnt(number<T::k_ds_read_insts>{});
             } else if constexpr (idx + 1 < T::NUM_D_SLICES) {
                 s_waitcnt_lgkmcnt(0_I);
@@ -408,17 +435,18 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gqa_kernel(opus_gqa_kar
         });
     };
 
-    auto compute_pv = [&](const auto& v_p_in, auto& s_v_buf) {
+    auto compute_pv = [&](const auto& p, auto& v, auto& o, auto& sv) {
         static_for<T::NUM_D_SLICES - 2>([&](auto i) {
             constexpr int idx = i.value;
-            v_o_slices[idx] = mma1(v_p_in, v_v[idx], v_o_slices[idx]);
-            v_v[idx + 2] = tr_load<T::VEC_TR_V>(s_v_buf, u_rv + skv_slice(number<idx + 2>{}));
+            constexpr int slot = idx & 1;
+            o[idx] = mma1(p, v[slot], o[idx]);
+            v[slot] = tr_load<T::VEC_TR_V>(sv, u_rv + skv_slice(number<idx + 2>{}));
             s_waitcnt_lgkmcnt(number<T::v_ds_read_insts>{});
             __builtin_amdgcn_sched_barrier(0);
         });
-        v_o_slices[T::NUM_D_SLICES - 2] = mma1(v_p_in, v_v[T::NUM_D_SLICES - 2], v_o_slices[T::NUM_D_SLICES - 2]);
+        o[T::NUM_D_SLICES - 2] = mma1(p, v[(T::NUM_D_SLICES - 2) & 1], o[T::NUM_D_SLICES - 2]);
         s_waitcnt_lgkmcnt(0_I);
-        v_o_slices[T::NUM_D_SLICES - 1] = mma1(v_p_in, v_v[T::NUM_D_SLICES - 1], v_o_slices[T::NUM_D_SLICES - 1]);
+        o[T::NUM_D_SLICES - 1] = mma1(p, v[(T::NUM_D_SLICES - 1) & 1], o[T::NUM_D_SLICES - 1]);
     };
 
     // Causal masking helpers
@@ -449,8 +477,15 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gqa_kernel(opus_gqa_kar
         __builtin_amdgcn_s_barrier();
     }
 
-    compute_qk(v_s[0], s_k[0]);
+    compute_qk(v_s[0], v_q_slices, v_k, s_k[0]);
     __builtin_amdgcn_sched_barrier(0);
+    if constexpr (T::CAUSAL) {
+        constexpr int tile_idx = 0;
+        constexpr int kv_end_pos = (tile_idx + 1) * T::KV_TILE_SIZE;
+        if (q_start_pos < kv_end_pos) {
+            attn_mask_causal_tile<T>(v_s[0], q_start_pos, tile_idx, neg_inf_v, lane_id);
+        }
+    }
     m_row = attn_row_max<T>(v_s[0]);
     attn_sub_row<T>(v_s[0], m_row);
     asm volatile("" : "+v"(v_s[0]) ::);
@@ -474,13 +509,14 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gqa_kernel(opus_gqa_kar
         __builtin_amdgcn_sched_barrier(0);
 
         // Cluster 1:
-        compute_qk(v_s[1], s_k[1]);
+        __builtin_amdgcn_s_setprio(1);
+        compute_qk(v_s[1], v_q_slices, v_k, s_k[1]);
         attn_exp2_slice<T, s_half_len, s_half_len>(v_s[0]);
         l_row += attn_row_sum<T>(v_s[0]);
         v_p = opus::cast<D_ATTN>(v_s[0]);
         asm volatile("" : "+v"(v_p) ::);
-        sched_barrier_exp_pairs<4, 1, 1, 0>();
-        sched_barrier_pairs<28, 1, 1, 0>();
+        sched_compute_qk<0>();
+        __builtin_amdgcn_s_setprio(0);
         __builtin_amdgcn_sched_barrier(0);
         __builtin_amdgcn_s_barrier();
         __builtin_amdgcn_sched_barrier(0);
@@ -497,7 +533,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gqa_kernel(opus_gqa_kar
 
         // Cluster 3:
         __builtin_amdgcn_s_setprio(1);
-        compute_pv(v_p, s_v[0]);
+        compute_pv(v_p, v_v, v_o_slices, s_v[0]);
         D_ACC row_max = attn_row_max<T>(v_s[1]);
         bool below_thresh = ((row_max - m_row) <= RESCALE_THRESHOLD);
         bool all_below = (__builtin_amdgcn_ballot_w64(below_thresh) == __builtin_amdgcn_read_exec());
@@ -528,13 +564,14 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gqa_kernel(opus_gqa_kar
         __builtin_amdgcn_sched_barrier(0);
 
         // Cluster 5:
-        compute_qk(v_s[0], s_k[0]);
+        __builtin_amdgcn_s_setprio(1);
+        compute_qk(v_s[0], v_q_slices, v_k, s_k[0]);
         attn_exp2_slice<T, s_half_len, s_half_len>(v_s[1]);
         l_row += attn_row_sum<T>(v_s[1]);
         v_p = opus::cast<D_ATTN>(v_s[1]);
         asm volatile("" : "+v"(v_p) ::);
-        sched_barrier_exp_pairs<4, 1, 1, 0>();
-        sched_barrier_pairs<28, 1, 1, 0>();
+        sched_compute_qk<0>();
+        __builtin_amdgcn_s_setprio(0);
         __builtin_amdgcn_sched_barrier(0);
         __builtin_amdgcn_s_barrier();
         __builtin_amdgcn_sched_barrier(0);
@@ -543,6 +580,13 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gqa_kernel(opus_gqa_kar
         async_load<T::VEC_KV>(g_k, s_k[0].ptr, u_gkv, u_skv, kv_tile(j + 1));
         v_v[0] = tr_load<T::VEC_TR_V>(s_v[1], u_rv);
         v_v[1] = tr_load<T::VEC_TR_V>(s_v[1], u_rv + skv_slice(1_I));
+        if constexpr (T::CAUSAL) {
+            const int tile_idx = j - 1;
+            const int kv_end_pos = (tile_idx + 1) * T::KV_TILE_SIZE;
+            if (q_start_pos < kv_end_pos) {
+                attn_mask_causal_tile<T>(v_s[0], q_start_pos, tile_idx, neg_inf_v, lane_id);
+            }
+        }
         s_waitcnt_lgkmcnt(number<T::v_ds_read_insts>{});
         s_waitcnt_vmcnt(number<T::k_buffer_load_insts + T::v_buffer_load_insts>{});
         __builtin_amdgcn_sched_barrier(0);
@@ -551,7 +595,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gqa_kernel(opus_gqa_kar
 
         // Cluster 7:
         __builtin_amdgcn_s_setprio(1);
-        compute_pv(v_p, s_v[1]);
+        compute_pv(v_p, v_v, v_o_slices, s_v[1]);
         row_max = attn_row_max<T>(v_s[0]);
         below_thresh = ((row_max - m_row) <= RESCALE_THRESHOLD);
         all_below = (__builtin_amdgcn_ballot_w64(below_thresh) == __builtin_amdgcn_read_exec());
@@ -584,13 +628,14 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gqa_kernel(opus_gqa_kar
     __builtin_amdgcn_sched_barrier(0);
 
     // Cluster 1:
-    compute_qk(v_s[1], s_k[1]);
+    __builtin_amdgcn_s_setprio(1);
+    compute_qk(v_s[1], v_q_slices, v_k, s_k[1]);
     attn_exp2_slice<T, s_half_len, s_half_len>(v_s[0]);
     l_row += attn_row_sum<T>(v_s[0]);
     v_p = opus::cast<D_ATTN>(v_s[0]);
     asm volatile("" : "+v"(v_p) ::);
-    sched_barrier_exp_pairs<4, 1, 1, 0>();
-    sched_barrier_pairs<28, 1, 1, 0>();
+    sched_compute_qk<0>();
+    __builtin_amdgcn_s_setprio(0);
     __builtin_amdgcn_sched_barrier(0);
     __builtin_amdgcn_s_barrier();
     __builtin_amdgcn_sched_barrier(0);
@@ -599,6 +644,13 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gqa_kernel(opus_gqa_kar
     async_load<T::VEC_KV>(g_k, s_k[1].ptr, u_gkv, u_skv, kv_tile(max_num_tiles - 1));
     v_v[0] = tr_load<T::VEC_TR_V>(s_v[0], u_rv);
     v_v[1] = tr_load<T::VEC_TR_V>(s_v[0], u_rv + skv_slice(1_I));
+    if constexpr (T::CAUSAL) {
+        const int tile_idx = max_num_tiles - 3;
+        const int kv_end_pos = (tile_idx + 1) * T::KV_TILE_SIZE;
+        if (q_start_pos < kv_end_pos) {
+            attn_mask_causal_tile<T>(v_s[1], q_start_pos, tile_idx, neg_inf_v, lane_id);
+        }
+    }
     s_waitcnt_lgkmcnt(number<T::v_ds_read_insts>{});
     s_waitcnt_vmcnt(number<T::k_buffer_load_insts + T::v_buffer_load_insts>{});
     __builtin_amdgcn_sched_barrier(0);
@@ -607,7 +659,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gqa_kernel(opus_gqa_kar
 
     // Cluster 3:
     __builtin_amdgcn_s_setprio(1);
-    compute_pv(v_p, s_v[0]);
+    compute_pv(v_p, v_v, v_o_slices, s_v[0]);
     D_ACC row_max = attn_row_max<T>(v_s[1]);
     rescale_m = __builtin_amdgcn_exp2f(m_row - row_max);
     m_row = row_max;
@@ -616,6 +668,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gqa_kernel(opus_gqa_kar
     attn_exp2_slice<T, 0, s_half_len>(v_s[1]);
     __builtin_amdgcn_sched_barrier(0);
     scale_output_tile<T>(v_o, rescale_m);
+    pin_output_tile(v_o);
     __builtin_amdgcn_s_setprio(0);
     __builtin_amdgcn_sched_barrier(0);
     __builtin_amdgcn_s_barrier();
@@ -632,14 +685,15 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gqa_kernel(opus_gqa_kar
     __builtin_amdgcn_sched_barrier(0);
 
     // Cluster 5:
-    compute_qk(v_s[0], s_k[0]);
+    __builtin_amdgcn_s_setprio(1);
+    compute_qk(v_s[0], v_q_slices, v_k, s_k[0]);
     l_row *= rescale_m;
     attn_exp2_slice<T, s_half_len, s_half_len>(v_s[1]);
     l_row += attn_row_sum<T>(v_s[1]);
     v_p = opus::cast<D_ATTN>(v_s[1]);
     asm volatile("" : "+v"(v_p) ::);
-    sched_barrier_exp_pairs<4, 1, 1, 0>();
-    sched_barrier_pairs<28, 1, 1, 0>();
+    sched_compute_qk<0>();
+    __builtin_amdgcn_s_setprio(0);
     __builtin_amdgcn_sched_barrier(0);
     __builtin_amdgcn_s_barrier();
     __builtin_amdgcn_sched_barrier(0);
@@ -647,6 +701,13 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gqa_kernel(opus_gqa_kar
     // Cluster 6:
     v_v[0] = tr_load<T::VEC_TR_V>(s_v[1], u_rv);
     v_v[1] = tr_load<T::VEC_TR_V>(s_v[1], u_rv + skv_slice(1_I));
+    if constexpr (T::CAUSAL) {
+        const int tile_idx = max_num_tiles - 2;
+        const int kv_end_pos = (tile_idx + 1) * T::KV_TILE_SIZE;
+        if (q_start_pos < kv_end_pos) {
+            attn_mask_causal_tile<T>(v_s[0], q_start_pos, tile_idx, neg_inf_v, lane_id);
+        }
+    }
     s_waitcnt_lgkmcnt(number<T::v_ds_read_insts>{});
     s_waitcnt_vmcnt(number<T::v_buffer_load_insts>{});
     __builtin_amdgcn_sched_barrier(0);
@@ -655,7 +716,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gqa_kernel(opus_gqa_kar
 
     // Cluster 7:
     __builtin_amdgcn_s_setprio(1);
-    compute_pv(v_p, s_v[1]);
+    compute_pv(v_p, v_v, v_o_slices, s_v[1]);
     row_max = attn_row_max<T>(v_s[0]);
     rescale_m = __builtin_amdgcn_exp2f(m_row - row_max);
     m_row = row_max;
@@ -664,6 +725,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gqa_kernel(opus_gqa_kar
     attn_exp2_slice<T, 0, s_half_len>(v_s[0]);
     __builtin_amdgcn_sched_barrier(0);
     scale_output_tile<T>(v_o, rescale_m);
+    pin_output_tile(v_o);
     __builtin_amdgcn_s_setprio(0);
     __builtin_amdgcn_sched_barrier(0);
     __builtin_amdgcn_s_barrier();
@@ -680,14 +742,15 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gqa_kernel(opus_gqa_kar
     __builtin_amdgcn_sched_barrier(0);
 
     // Cluster 9:
-    compute_qk(v_s[1], s_k[1]);
+    __builtin_amdgcn_s_setprio(1);
+    compute_qk(v_s[1], v_q_slices, v_k, s_k[1]);
     l_row *= rescale_m;
     attn_exp2_slice<T, s_half_len, s_half_len>(v_s[0]);
     l_row += attn_row_sum<T>(v_s[0]);
     v_p = opus::cast<D_ATTN>(v_s[0]);
     asm volatile("" : "+v"(v_p) ::);
-    sched_barrier_exp_pairs<4, 1, 1, 0>();
-    sched_barrier_pairs<28, 1, 1, 0>();
+    sched_compute_qk<0>();
+    __builtin_amdgcn_s_setprio(0);
     __builtin_amdgcn_sched_barrier(0);
     __builtin_amdgcn_s_barrier();
     __builtin_amdgcn_sched_barrier(0);
@@ -695,6 +758,13 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gqa_kernel(opus_gqa_kar
     // Cluster 10:
     v_v[0] = tr_load<T::VEC_TR_V>(s_v[0], u_rv);
     v_v[1] = tr_load<T::VEC_TR_V>(s_v[0], u_rv + skv_slice(1_I));
+    if constexpr (T::CAUSAL) {
+        const int tile_idx = max_num_tiles - 1;
+        const int kv_end_pos = (tile_idx + 1) * T::KV_TILE_SIZE;
+        if (q_start_pos < kv_end_pos) {
+            attn_mask_causal_tile<T>(v_s[1], q_start_pos, tile_idx, neg_inf_v, lane_id);
+        }
+    }
     s_waitcnt_lgkmcnt(number<T::v_ds_read_insts>{});
     s_waitcnt_vmcnt(0_I);
     __builtin_amdgcn_sched_barrier(0);
@@ -702,7 +772,8 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gqa_kernel(opus_gqa_kar
     __builtin_amdgcn_sched_barrier(0);
 
     // Cluster 11:
-    compute_pv(v_p, s_v[0]);
+    __builtin_amdgcn_s_setprio(1);
+    compute_pv(v_p, v_v, v_o_slices, s_v[0]);
     row_max = attn_row_max<T>(v_s[1]);
     rescale_m = __builtin_amdgcn_exp2f(m_row - row_max);
     m_row = row_max;
@@ -718,6 +789,8 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gqa_kernel(opus_gqa_kar
     asm volatile("" : "+v"(v_p) ::);
     __builtin_amdgcn_sched_barrier(0);
     scale_output_tile<T>(v_o, rescale_m);
+    pin_output_tile(v_o);
+    __builtin_amdgcn_s_setprio(0);
     __builtin_amdgcn_s_barrier();
     __builtin_amdgcn_sched_barrier(0);
 
@@ -730,7 +803,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gqa_kernel(opus_gqa_kar
     __builtin_amdgcn_sched_barrier(0);
 
     // Cluster 13:
-    compute_pv(v_p, s_v[1]);
+    compute_pv(v_p, v_v, v_o_slices, s_v[1]);
 
     // ──── Normalize O and store to gmem ────
     D_ACC l_inv = (l_row > D_ACC(0.0f)) ? (D_ACC(1.0f) / l_row) : D_ACC(0.0f);
