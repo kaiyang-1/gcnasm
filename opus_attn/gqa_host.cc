@@ -344,9 +344,9 @@ int main(int argc, char** argv) {
 
     int rc;
     if (causal)
-        rc = run(opus_gqa_traits<32, 64, 512, 8, true>{});
+        rc = run(opus_gqa_traits<16, 32, 512, 8, true>{});
     else
-        rc = run(opus_gqa_traits<32, 64, 512, 8, false>{});
+        rc = run(opus_gqa_traits<16, 32, 512, 8, false>{});
     if (rc) return rc;
 
     // Cleanup

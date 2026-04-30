@@ -5,8 +5,8 @@
 #include "gqa_defs.h"
 #ifndef __HIP_DEVICE_COMPILE__
 template<typename Traits> __global__ void gqa_kernel(opus_gqa_kargs kargs) {}
-template __global__ void gqa_kernel<opus_gqa_traits<32, 64, 512, 8, false>>(opus_gqa_kargs);
+template __global__ void gqa_kernel<opus_gqa_traits<16, 32, 512, 8, false>>(opus_gqa_kargs);
 #else
 #include "gqa_kernel_template.hpp"
-template __global__ void gqa_kernel<opus_gqa_traits<32, 64, 512, 8, false>>(opus_gqa_kargs);
+template __global__ void gqa_kernel<opus_gqa_traits<16, 32, 512, 8, false>>(opus_gqa_kargs);
 #endif

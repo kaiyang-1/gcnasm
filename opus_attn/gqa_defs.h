@@ -23,8 +23,8 @@ struct opus_gqa_kargs {
 };
 
 // Configuration traits for GQA kernel (tile sizes, data types, vector lengths, MFMA config)
-template<int Q_TILE_SIZE_ = 32,
-        int KV_TILE_SIZE_ = 64,
+template<int Q_TILE_SIZE_ = 16,
+        int KV_TILE_SIZE_ = 32,
         int D_TILE_SIZE_ = 512,
         int NUM_WARPS_ = 8,
         bool CAUSAL_ = false>
@@ -47,19 +47,23 @@ struct opus_gqa_traits {
     static constexpr int T_N = 1;         // waves along N
     static constexpr int T_K = 1;         // waves along K
 
-    // MFMA base tile (bf16 32x32x16 on gfx950)
-    static constexpr int W_M = 32;
-    static constexpr int W_N = 32;
-    static constexpr int W_K = 16;
+    // MFMA base tile (bf16 16x16x32 on gfx950)
+    static constexpr int W_M = 16;
+    static constexpr int W_N = 16;
+    static constexpr int W_K = 32;
+
+    static constexpr int SLICE_D = 32;
+    static constexpr int NUM_D_SLICES = D_TILE_SIZE / SLICE_D;
+    static_assert(D_TILE_SIZE % SLICE_D == 0);
 
     // GEMM0: S[Q_TILE x KV_TILE] = Q[Q_TILE x D] @ K^T[D x KV_TILE]
     static constexpr int GEMM0_E_M = Q_TILE_SIZE / W_M;
     static constexpr int GEMM0_E_N = KV_TILE_SIZE / W_N;
-    static constexpr int GEMM0_E_K = D_TILE_SIZE / W_K;
+    static constexpr int GEMM0_E_K = SLICE_D / W_K;
 
     // GEMM1: O[Q_TILE x D] = P[Q_TILE x KV_TILE] @ V[KV_TILE x D]
     static constexpr int GEMM1_E_M = Q_TILE_SIZE / W_M;
-    static constexpr int GEMM1_E_N = D_TILE_SIZE / W_N;
+    static constexpr int GEMM1_E_N = SLICE_D / W_N;
     static constexpr int GEMM1_E_K = KV_TILE_SIZE / W_K;
 
     // Vector lengths for global load/store
@@ -72,13 +76,12 @@ struct opus_gqa_traits {
     static constexpr int D_128B_SIZE = 128 / sizeof(D_ATTN);
     static_assert(VEC_KV == 16 / sizeof(D_ATTN));
     static constexpr int smem_linear_wave = WARP_SIZE * 16 / sizeof(D_ATTN);
-    static constexpr int smem_n_sub = smem_linear_wave / D_128B_SIZE;
-    static constexpr int smem_n_rpt = KV_TILE_SIZE / smem_n_sub;
+    static constexpr int smem_n_per_wave = smem_linear_wave / D_128B_SIZE;
+    static constexpr int smem_n_rpt = KV_TILE_SIZE / smem_n_per_wave;
     static constexpr int smem_d_rpt = D_TILE_SIZE / D_128B_SIZE;
-    static constexpr int smem_padding_16B = 16 / sizeof(D_ATTN);
-    static constexpr int smem_padding_64B = 64 / sizeof(D_ATTN);
-    static constexpr int smem_k_tile_elems = smem_n_rpt * smem_d_rpt * (smem_linear_wave + smem_padding_16B);
-    static constexpr int smem_v_tile_elems = smem_n_rpt * smem_d_rpt * (smem_linear_wave + smem_padding_64B);
+    static constexpr int smem_padding_32B = 32 / sizeof(D_ATTN);
+    static constexpr int smem_k_tile_elems = smem_n_rpt * smem_d_rpt * (smem_linear_wave + smem_padding_32B);
+    static constexpr int smem_v_tile_elems = smem_n_rpt * smem_d_rpt * (smem_linear_wave + smem_padding_32B);
     static constexpr int smem_buffer_elems = smem_k_tile_elems + smem_v_tile_elems;
 
     static constexpr int k_buffer_load_insts = (KV_TILE_SIZE * D_TILE_SIZE) / (BLOCK_SIZE * VEC_KV);
