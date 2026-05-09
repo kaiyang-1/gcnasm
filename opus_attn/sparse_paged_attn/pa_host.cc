@@ -4,6 +4,7 @@
 #include <iostream>
 #include <numeric>
 #include <memory>
+#include <vector>
 #include <cstring>
 #include <cstdlib>
 #include <cassert>
@@ -47,7 +48,7 @@ void rand_vector(T* ptr, size_t size, float min_val = 0.0f, float max_val = 1.0f
     }
 }
 
-// Benchmark GQA kernel performance with warm-up and timing
+// Benchmark PA kernel performance with warm-up and timing
 template<class Traits>
 void benchmark_pa_kernel(const pa_kargs& kargs, dim3 grid, dim3 block,
                           int warmup = 100, int iterations = 50) {
@@ -76,8 +77,8 @@ void benchmark_pa_kernel(const pa_kargs& kargs, dim3 grid, dim3 block,
     CHECK_HIP(hipEventDestroy(stop));
 
     const float avg_time = total_time / iterations;
-    //   full attention  -> 4 * H * N^2 * D
-    const double flops = (4.0 * kargs.H * kargs.N * kargs.N * kargs.D);
+    //   sparse attention -> 4 * H * nnz(indices) * D
+    const double flops = (4.0 * kargs.H * kargs.indices_prefix_sum * kargs.D);
     const double tflops = flops / (avg_time * 1e-3) / 1e12;
 
     printf("PA Prefill Kernel Performance: avg_time=%.3f ms, %.2f TFlops\n",
@@ -118,75 +119,80 @@ bool validate_pa_results(const bf16_t* ref, const bf16_t* gpu,
     return all_valid;
 }
 
-// ─── CPU reference: Grouped-Query Attention (GQA) ──────────────────────────
+// ─── CPU reference: Paged Attention (PA) ──────────────────────────
 //
-// Q  layout: [B, N, H,    D]   (row-major, contiguous in D)
-// K  layout: [B, N, H_KV, D]
-// V  layout: [B, N, H_KV, D]
-// O  layout: [B, N, H,    D]
-//
-// Standard scaled-dot-product attention with online softmax:
-//   S[i,j]  = sum_d Q[b,i,h,d] * K[b,j,h_kv,d]   (h_kv = h / group_size)
-//   P[i,:]  = softmax( S[i,:] / sqrt(D) )
-//   O[i,d]  = sum_j P[i,j] * V[b,j,h_kv,d]
+// Sparse scaled-dot-product attention over CSR rows:
+//   rows_i = kv_indices[kv_indptr[i] : kv_indptr[i+1]]
+//   S[i,p] = sum_d Q[i,h,d] * K[rows_i[p],d]
+//   O[i,h,d] = sum_p softmax(S[i,p] / sqrt(D)) * V[rows_i[p],d]
 //
 void pa_attention_ref(
     const bf16_t* Q,  // [N, H, D]
-    const bf16_t* K,  // [N, H_KV, D]
-    const bf16_t* V,  // [N, H_KV, D]
+    const bf16_t* K,  // [total_pages, D]
+    const bf16_t* V,  // [total_pages, D]
     bf16_t*       O,  // [N, H, D]
-    int N, int H, int H_KV, int D)
+    const int* kv_indptr,
+    const int* kv_indices,
+    int N, int H, int D)
 {
-    const int GROUP_SIZE = H / H_KV;
     const float scale = 1.0f / std::sqrt(static_cast<float>(D));
 
     // Strides (row-major, last dim = D is contiguous)
-    const int stride_q_n = H * D;
-    const int stride_q_h = D;
-
-    const int stride_kv_n = H_KV * D;
-    const int stride_kv_h = D;
+    const int stride_qo_n = H * D;
+    const int stride_qo_h = D;
+    const int stride_kv_page = D;
 
     #pragma omp parallel for collapse(2)
     for (int h = 0; h < H; h++) {
         for (int i = 0; i < N; i++) {
-            const int h_kv = h / GROUP_SIZE;
-            const bf16_t* q_row = Q + i * stride_q_n + h * stride_q_h;
+            const bf16_t* q_row = Q + i * stride_qo_n + h * stride_qo_h;
+            const int row_begin = kv_indptr[i];
+            const int row_end = kv_indptr[i + 1];
+            const int num_rows = row_end - row_begin;
 
-            // ---- Compute attention scores S[j] = Q[i,h,:] . K[j,h_kv,:] ----
-            const int max_j = N;
-            std::vector<float> scores(max_j);
-            for (int j = 0; j < max_j; j++) {
-                const bf16_t* k_row = K + j * stride_kv_n + h_kv * stride_kv_h;
+            if (num_rows <= 0) {
+                bf16_t* o_row = O + i * stride_qo_n + h * stride_qo_h;
+                for (int d = 0; d < D; d++) {
+                    o_row[d] = static_cast<bf16_t>(0.0f);
+                }
+                continue;
+            }
+
+            // ---- Compute attention scores S[p] = Q[i,h,:] . K[kv_indices[p],:] ----
+            std::vector<float> scores(num_rows);
+            for (int p = 0; p < num_rows; p++) {
+                const int kv_row = kv_indices[row_begin + p];
+                const bf16_t* k_row = K + kv_row * stride_kv_page;
                 float dot = 0.0f;
                 for (int d = 0; d < D; d++) {
                     dot += static_cast<float>(q_row[d] * k_row[d]);
                 }
-                scores[j] = dot * scale;
+                scores[p] = dot * scale;
             }
 
             // ---- Softmax ----
             float max_score = *std::max_element(scores.begin(), scores.end());
             float sum_exp = 0.0f;
-            for (int j = 0; j < max_j; j++) {
-                scores[j] = std::exp(scores[j] - max_score);
-                sum_exp += scores[j];
+            for (int p = 0; p < num_rows; p++) {
+                scores[p] = std::exp(scores[p] - max_score);
+                sum_exp += scores[p];
             }
-            for (int j = 0; j < max_j; j++) {
-                scores[j] /= sum_exp;
+            for (int p = 0; p < num_rows; p++) {
+                scores[p] /= sum_exp;
             }
-            std::vector<bf16_t> p_row(max_j);
-            for (int j = 0; j < max_j; j++) {
-                p_row[j] = static_cast<bf16_t>(scores[j]);
+            std::vector<bf16_t> p_row(num_rows);
+            for (int p = 0; p < num_rows; p++) {
+                p_row[p] = static_cast<bf16_t>(scores[p]);
             }
 
-            // ---- Output: O[i,h,d] = sum_j P[j] * V[j,h_kv,d] ----
-            bf16_t* o_row = O + i * stride_q_n + h * stride_q_h;
+            // ---- Output: O[i,h,d] = sum_p P[p] * V[kv_indices[p],d] ----
+            bf16_t* o_row = O + i * stride_qo_n + h * stride_qo_h;
             for (int d = 0; d < D; d++) {
                 float acc = 0.0f;
-                for (int j = 0; j < max_j; j++) {
-                    const bf16_t* v_row = V + j * stride_kv_n + h_kv * stride_kv_h;
-                    acc += static_cast<float>(p_row[j] * v_row[d]);
+                for (int p = 0; p < num_rows; p++) {
+                    const int kv_row = kv_indices[row_begin + p];
+                    const bf16_t* v_row = V + kv_row * stride_kv_page;
+                    acc += static_cast<float>(p_row[p] * v_row[d]);
                 }
                 o_row[d] = static_cast<bf16_t>(acc);
             }
@@ -197,10 +203,10 @@ void pa_attention_ref(
 // ─── main ───────────────────────────────────────────────────────────────────
 
 int main(int argc, char** argv) {
-    int H    = 128;   // query heads
-    int H_KV = 1;     // key/value heads
-    int N    = 1024;  // sequence length
-    int D    = 512;   // head dimension
+    int H = 128;   // query heads
+    int N = 1024;  // sequence length
+    int D = 512;   // head dimension
+    int total_pages = N; // total number of pages for kv cache
 
     // Parse command line arguments. Supports: -n 16384 and -n=16384.
     bool verify = false;
@@ -225,44 +231,59 @@ int main(int argc, char** argv) {
             return false;
         };
         if (try_parse(H, "-h_q")) continue;
-        if (try_parse(H_KV, "-h_kv")) continue;
         if (try_parse(N, "-n")) continue;
         if (try_parse(D, "-d")) continue;
+        if (try_parse(total_pages, "-total_pages")) continue;
     }
 
-    if (H <= 0 || H_KV <= 0 || N <= 0 || D <= 0 || H % H_KV != 0) {
-        std::cerr << "Invalid parameters. H_Q,H_KV,N,D must be positive and H_Q must be divisible by H_KV.\n";
+    if (H <= 0 || N <= 0 || D <= 0 || total_pages <= 0) {
+        std::cerr << "Invalid parameters. H_Q,N,D,total_pages must be positive.\n";
         return 1;
     }
 
-    const int GROUP_SIZE = H / H_KV;
-    printf("PA Prefill Attention: H_Q=%d, H_KV=%d, GROUP_SIZE=%d, N=%d, D=%d\n",
-           H, H_KV, GROUP_SIZE, N, D);
+    printf("PA Prefill Attention: H_Q=%d, N=%d, D=%d, total_pages=%d\n",
+           H, N, D, total_pages);
 
     // Allocate host memory
     const size_t q_size = (size_t)N * H * D;
-    const size_t kv_size = (size_t)N * H_KV * D;
+    const size_t kv_size = (size_t)total_pages * D;
+    const int indices_prefix_sum = N * total_pages;
     auto host_q = std::make_unique<bf16_t[]>(q_size);
     auto host_k = std::make_unique<bf16_t[]>(kv_size);
     auto host_v = std::make_unique<bf16_t[]>(kv_size);
     auto host_o_ref = std::make_unique<bf16_t[]>(q_size);
     auto host_o_gpu = std::make_unique<bf16_t[]>(q_size);
+    std::vector<int> host_kv_indptr(N + 1);
+    std::vector<int> host_kv_indices(indices_prefix_sum);
 
     // Initialize with random data
     rand_vector(host_q.get(), q_size, -2.f, 2.f);
     rand_vector(host_k.get(), kv_size, -2.f, 2.f);
     rand_vector(host_v.get(), kv_size, -2.f, 2.f);
+    for (int i = 0; i <= N; ++i) {
+        host_kv_indptr[i] = i * total_pages;
+    }
+    for (int i = 0; i < N; ++i) {
+        for (int page = 0; page < total_pages; ++page) {
+            host_kv_indices[i * total_pages + page] = page;
+        }
+    }
 
     // Allocate device memory
     bf16_t *dev_q, *dev_k, *dev_v, *dev_o;
+    int *dev_kv_indptr, *dev_kv_indices;
     CHECK_HIP(hipMalloc(&dev_q, q_size * sizeof(bf16_t)));
     CHECK_HIP(hipMalloc(&dev_k, kv_size * sizeof(bf16_t)));
     CHECK_HIP(hipMalloc(&dev_v, kv_size * sizeof(bf16_t)));
     CHECK_HIP(hipMalloc(&dev_o, q_size * sizeof(bf16_t)));
+    CHECK_HIP(hipMalloc(&dev_kv_indptr, host_kv_indptr.size() * sizeof(int)));
+    CHECK_HIP(hipMalloc(&dev_kv_indices, host_kv_indices.size() * sizeof(int)));
 
     CHECK_HIP(hipMemcpy(dev_q, host_q.get(), q_size * sizeof(bf16_t), hipMemcpyHostToDevice));
     CHECK_HIP(hipMemcpy(dev_k, host_k.get(), kv_size * sizeof(bf16_t), hipMemcpyHostToDevice));
     CHECK_HIP(hipMemcpy(dev_v, host_v.get(), kv_size * sizeof(bf16_t), hipMemcpyHostToDevice));
+    CHECK_HIP(hipMemcpy(dev_kv_indptr, host_kv_indptr.data(), host_kv_indptr.size() * sizeof(int), hipMemcpyHostToDevice));
+    CHECK_HIP(hipMemcpy(dev_kv_indices, host_kv_indices.data(), host_kv_indices.size() * sizeof(int), hipMemcpyHostToDevice));
 
     // Setup kernel arguments
     pa_kargs kargs{};
@@ -270,14 +291,16 @@ int main(int argc, char** argv) {
     kargs.ptr_k = dev_k;
     kargs.ptr_v = dev_v;
     kargs.ptr_o = dev_o;
+    kargs.kv_indptr = dev_kv_indptr;
+    kargs.kv_indices = dev_kv_indices;
     kargs.N = N;
     kargs.H = H;
-    kargs.H_KV = H_KV;
     kargs.D = D;
-    kargs.stride_q_n = H * D;
-    kargs.stride_q_h = D;
-    kargs.stride_kv_n = H_KV * D;
-    kargs.stride_kv_h = D;
+    kargs.total_pages = total_pages;
+    kargs.indices_prefix_sum = indices_prefix_sum;
+    kargs.stride_qo_n = H * D;
+    kargs.stride_qo_h = D;
+    kargs.stride_kv_page = D;
 
     // Dispatch to kernel
     auto run = [&]<typename PATraits>(PATraits) {
@@ -285,20 +308,20 @@ int main(int argc, char** argv) {
             std::cerr << "This kernel only supports head dimension D=" << PATraits::D_TILE_SIZE << ", got D=" << D << "\n";
             return 1;
         }
-        if ((N % PATraits::KV_TILE_SIZE) != 0 || (N / PATraits::KV_TILE_SIZE) < 6) {
-            std::cerr << "This attend-style pipeline requires N to be a multiple of "
-                      << PATraits::KV_TILE_SIZE << " and span at least 6 KV tiles, got N=" << N << "\n";
+        if ((total_pages % PATraits::KV_TILE_SIZE) != 0 || (total_pages / PATraits::KV_TILE_SIZE) < 6) {
+            std::cerr << "This attend-style pipeline requires total_pages to be a multiple of "
+                      << PATraits::KV_TILE_SIZE << " and span at least 6 KV tiles, got total_pages=" << total_pages << "\n";
             return 1;
         }
-        if ((N % (PATraits::Q_TILE_SIZE * PATraits::NUM_WARPS)) != 0) {
-            std::cerr << "This kernel requires N to be a multiple of "
+        if ((H % (PATraits::Q_TILE_SIZE * PATraits::NUM_WARPS)) != 0) {
+            std::cerr << "This kernel requires H to be a multiple of "
                       << (PATraits::Q_TILE_SIZE * PATraits::NUM_WARPS)
-                      << " so every warp maps to a valid Q tile, got N=" << N << "\n";
+                      << " so every warp maps to a valid H tile, got H=" << H << "\n";
             return 1;
         }
-        const int num_q_tiles = ceil_div(N, PATraits::Q_TILE_SIZE);
-        const int num_q_blocks = ceil_div(num_q_tiles, PATraits::NUM_WARPS);
-        dim3 grid(H, num_q_blocks, 1);
+        const int num_h_tiles = ceil_div(H, PATraits::Q_TILE_SIZE);
+        const int num_h_blocks = ceil_div(num_h_tiles, PATraits::NUM_WARPS);
+        dim3 grid(N, num_h_blocks, 1);
         dim3 block(PATraits::BLOCK_SIZE);
 
         printf("PA kernel launch config: grid=(%d,%d,%d), block=%d (NUM_WARPS=%d), smem=%zu bytes (K/V tiles)\n",
@@ -311,7 +334,7 @@ int main(int argc, char** argv) {
             printf("\nValidating GPU results against CPU reference...\n");
             CHECK_HIP(hipMemcpy(host_o_gpu.get(), dev_o, q_size * sizeof(bf16_t), hipMemcpyDeviceToHost));
             pa_attention_ref(host_q.get(), host_k.get(), host_v.get(), host_o_ref.get(),
-                              N, H, H_KV, D);
+                              host_kv_indptr.data(), host_kv_indices.data(), N, H, D);
 
             bool all_valid = validate_pa_results(host_o_ref.get(), host_o_gpu.get(), N, H, D);
             printf("\n[Overall] %s\n", all_valid ? "✓ GPU KERNEL VALID" : "✗ GPU KERNEL FAILED");
@@ -338,6 +361,8 @@ int main(int argc, char** argv) {
     CHECK_HIP(hipFree(dev_k));
     CHECK_HIP(hipFree(dev_v));
     CHECK_HIP(hipFree(dev_o));
+    CHECK_HIP(hipFree(dev_kv_indptr));
+    CHECK_HIP(hipFree(dev_kv_indices));
 
     return 0;
 }

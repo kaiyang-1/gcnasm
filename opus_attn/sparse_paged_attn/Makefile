@@ -5,7 +5,7 @@ ARCH            ?= gfx950
 COMMON_FLAGS = -I. -I$(OPUS_INCLUDE_DIR) -std=c++20 -fopenmp -O3 -Wall --offload-arch=$(ARCH) -ffast-math
 
 BUILD = build
-OUT   = $(BUILD)/gqa_attn.exe
+OUT   = $(BUILD)/pa_prefill.exe
 
 KERNEL_SRCS = pa_prefill_kernel.cc
 HOST_SRC    = pa_host.cc

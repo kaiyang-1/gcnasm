@@ -6,17 +6,19 @@ using bf16_t = __bf16;
 // Kernel arguments for PA prefill attention
 struct pa_kargs {
     const void* __restrict__ ptr_q;  // [N, H, D]
-    const void* __restrict__ ptr_k;  // [N, H_KV, D]
-    const void* __restrict__ ptr_v;  // [N, H_KV, D]
+    const void* __restrict__ ptr_k;  // [total_pages, D]
+    const void* __restrict__ ptr_v;  // [total_pages, D]
     void* __restrict__ ptr_o;        // [N, H, D]
+    const int* __restrict__ kv_indptr;  // [N+1]
+    const int* __restrict__ kv_indices; // [indices_prefix_sum]
     int N;
     int H;
-    int H_KV;
     int D;
-    int stride_q_n;
-    int stride_q_h;
-    int stride_kv_n;
-    int stride_kv_h;
+    int total_pages;
+    int indices_prefix_sum;
+    int stride_qo_n;
+    int stride_qo_h;
+    int stride_kv_page;
 };
 
 // Configuration traits for PA kernel (tile sizes, data types, vector lengths, MFMA config).
@@ -80,7 +82,6 @@ struct pa_traits {
 
     static constexpr int smem_k_tile_elems = smem_n_rpt * smem_d_rpt * (smem_linear_wave + smem_padding_32B);
     static constexpr int smem_v_tile_elems = smem_n_rpt * smem_d_rpt * (smem_linear_wave + smem_padding_32B);
-    static constexpr int smem_buffer_elems = smem_k_tile_elems + smem_v_tile_elems;
 
     static constexpr int k_buffer_load_insts = (KV_TILE_SIZE * D_TILE_SIZE) / (BLOCK_SIZE * VEC_KV);
     static constexpr int v_buffer_load_insts = (KV_TILE_SIZE * D_TILE_SIZE) / (BLOCK_SIZE * VEC_KV);
@@ -88,7 +89,7 @@ struct pa_traits {
     static constexpr int v_ds_read_insts = (GEMM1_E_N * GEMM1_E_K * W_N * W_K) / (WARP_SIZE * VEC_TR_V);
 
     static constexpr size_t smem_size_bytes() {
-        return 2 * smem_buffer_elems * sizeof(D_ATTN);
+        return 2 * (smem_k_tile_elems + smem_v_tile_elems) * sizeof(D_ATTN);
     }
 };
 
