@@ -298,15 +298,12 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_kernel(pa_ka
     auto g_kv_indices = make_gmem(kargs.kv_indices + page_idx_begin, (kargs.indices_prefix_sum - page_idx_begin) * sizeof(int));
 
     // Shared memory for K and V tiles
-    __shared__ char smem_buf[T::smem_size_bytes()];
-    smem<D_ATTN> s_k[2] = {
-        make_smem(reinterpret_cast<D_ATTN*>(smem_buf)),
-        make_smem(reinterpret_cast<D_ATTN*>(smem_buf) + T::smem_k_tile_elems)
-    };
-    smem<D_ATTN> s_v[2] = {
-        make_smem(reinterpret_cast<D_ATTN*>(smem_buf) + 2 * T::smem_k_tile_elems),
-        make_smem(reinterpret_cast<D_ATTN*>(smem_buf) + 2 * T::smem_k_tile_elems + T::smem_v_tile_elems)
-    };
+    __shared__ char smem_k_buf[2 * T::smem_k_tile_elems * sizeof(D_ATTN)];
+    auto s_k = make_smem(reinterpret_cast<D_ATTN*>(smem_k_buf));
+    __shared__ char smem_v_buf[2 * T::smem_v_tile_elems * sizeof(D_ATTN)];
+    auto s_v = make_smem(reinterpret_cast<D_ATTN*>(smem_v_buf));
+    constexpr auto sk_slot_offset = number<T::smem_k_tile_elems>{};
+    constexpr auto sv_slot_offset = number<T::smem_v_tile_elems>{};
 
     // GEMM0: S = Q @ K^T
     auto mma0 = make_tiled_mma<D_ATTN, D_ATTN, D_ACC>(
@@ -366,14 +363,14 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_kernel(pa_ka
     };
     int kv_page[4];
 
-    auto compute_qk = [&](auto& s, const auto& q, auto& k, auto& sk) {
+    auto compute_qk = [&](auto& s, const auto& q, auto& k, auto rk_offset) {
         clear(s);
         static_for<T::NUM_D_SLICES>([&](auto i) {
             constexpr int idx = i.value;
             constexpr int slot = idx & 1;
             s = mma0(q[idx], k[slot], s);
             if constexpr (idx + 2 < T::NUM_D_SLICES) {
-                k[slot] = load<T::VEC_KV>(sk, u_rk + skv_slice(number<idx + 2>{}));
+                k[slot] = load<T::VEC_KV>(s_k, u_rk + rk_offset + skv_slice(number<idx + 2>{}));
                 s_waitcnt_lgkmcnt(number<T::k_ds_read_insts>{});
             } else if constexpr (idx + 1 < T::NUM_D_SLICES) {
                 s_waitcnt_lgkmcnt(0_I);
@@ -381,12 +378,12 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_kernel(pa_ka
         });
     };
 
-    auto compute_pv = [&](const auto& p, auto& v, auto& o, auto& sv) {
+    auto compute_pv = [&](const auto& p, auto& v, auto& o, auto rv_offset) {
         static_for<T::NUM_D_SLICES - 2>([&](auto i) {
             constexpr int idx = i.value;
             constexpr int slot = idx & 1;
             o[idx] = mma1(p, v[slot], o[idx]);
-            v[slot] = tr_load<T::VEC_TR_V>(sv, u_rv + skv_slice(number<idx + 2>{}));
+            v[slot] = tr_load<T::VEC_TR_V>(s_v, u_rv + rv_offset + skv_slice(number<idx + 2>{}));
             s_waitcnt_lgkmcnt(number<T::v_ds_read_insts>{});
             __builtin_amdgcn_sched_barrier(0);
         });
@@ -397,7 +394,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_kernel(pa_ka
 
     // Prologue
     kv_page[2] = load_kv_page(0);
-    async_load<T::VEC_KV>(g_k, s_k[0].ptr, u_gkv + kv_token_offset(kv_page[2]), u_skv);
+    async_load<T::VEC_KV>(g_k, s_k.ptr, u_gkv + kv_token_offset(kv_page[2]), u_skv);
     __builtin_amdgcn_s_waitcnt(0);
     __builtin_amdgcn_sched_barrier(0);
     __builtin_amdgcn_s_barrier();
@@ -408,16 +405,17 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_kernel(pa_ka
     v_q = opus::cast<D_ATTN>(v_q_f32);
 
     kv_page[0] = load_kv_page(1);
-    async_load<T::VEC_KV>(g_k, s_k[1].ptr, u_gkv + kv_token_offset(kv_page[0]), u_skv);
+    async_load<T::VEC_KV>(g_k, s_k.ptr, u_gkv + kv_token_offset(kv_page[0]), u_skv + sk_slot_offset);
+    async_load<T::VEC_KV>(g_v, s_v.ptr, u_gkv + kv_token_offset(kv_page[2]), u_skv);
+    __builtin_amdgcn_sched_barrier(0);
     kv_page[1] = load_kv_page(2);
-    async_load<T::VEC_KV>(g_v, s_v[0].ptr, u_gkv + kv_token_offset(kv_page[2]), u_skv);
-    v_k[0] = load<T::VEC_KV>(s_k[0], u_rk);
-    v_k[1] = load<T::VEC_KV>(s_k[0], u_rk + skv_slice(1_I));
+    v_k[0] = load<T::VEC_KV>(s_k, u_rk);
+    v_k[1] = load<T::VEC_KV>(s_k, u_rk + skv_slice(1_I));
     __builtin_amdgcn_sched_barrier(0);
     s_waitcnt_lgkmcnt(number<T::k_ds_read_insts>{});
     s_waitcnt_vmcnt(number<T::v_buffer_load_insts + 1>{});
 
-    compute_qk(v_s[0], v_q_slices, v_k, s_k[0]);
+    compute_qk(v_s[0], v_q_slices, v_k, 0_I);
     
     if (stagger) {
         __builtin_amdgcn_sched_barrier(0);
@@ -436,11 +434,11 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_kernel(pa_ka
     for (int j = 1; j < num_kv_tiles - 3; j += 2) {
         // Cluster 0:
         s_waitcnt_vmcnt(number<T::v_buffer_load_insts>{});
-        async_load<T::VEC_KV>(g_k, s_k[0].ptr, u_gkv + kv_token_offset(kv_page[1]), u_skv);
+        async_load<T::VEC_KV>(g_k, s_k.ptr, u_gkv + kv_token_offset(kv_page[1]), u_skv);
         __builtin_amdgcn_sched_barrier(0);
         kv_page[2] = load_kv_page(j + 2);
-        v_k[0] = load<T::VEC_KV>(s_k[1], u_rk);
-        v_k[1] = load<T::VEC_KV>(s_k[1], u_rk + skv_slice(1_I));
+        v_k[0] = load<T::VEC_KV>(s_k, u_rk + sk_slot_offset);
+        v_k[1] = load<T::VEC_KV>(s_k, u_rk + sk_slot_offset + skv_slice(1_I));
         s_waitcnt_lgkmcnt(number<T::k_ds_read_insts>{});
         s_waitcnt_vmcnt(number<T::k_buffer_load_insts + 1>{});
         __builtin_amdgcn_sched_barrier(0);
@@ -449,7 +447,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_kernel(pa_ka
 
         // Cluster 1:
         __builtin_amdgcn_s_setprio(1);
-        compute_qk(v_s[1], v_q_slices, v_k, s_k[1]);
+        compute_qk(v_s[1], v_q_slices, v_k, sk_slot_offset);
         attn_exp2_slice<T, s_half_len, s_half_len>(v_s[0]);
         l_row += attn_row_sum<T>(v_s[0]);
         v_p = opus::cast<D_ATTN>(v_s[0]);
@@ -461,9 +459,9 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_kernel(pa_ka
         __builtin_amdgcn_sched_barrier(0);
 
         // Cluster 2:
-        async_load<T::VEC_KV>(g_v, s_v[1].ptr, u_gkv + kv_token_offset(kv_page[0]), u_skv);
-        v_v[0] = tr_load<T::VEC_TR_V>(s_v[0], u_rv);
-        v_v[1] = tr_load<T::VEC_TR_V>(s_v[0], u_rv + skv_slice(1_I));
+        async_load<T::VEC_KV>(g_v, s_v.ptr, u_gkv + kv_token_offset(kv_page[0]), u_skv + sv_slot_offset);
+        v_v[0] = tr_load<T::VEC_TR_V>(s_v, u_rv);
+        v_v[1] = tr_load<T::VEC_TR_V>(s_v, u_rv + skv_slice(1_I));
         s_waitcnt_lgkmcnt(number<T::v_ds_read_insts>{});
         s_waitcnt_vmcnt(number<T::v_buffer_load_insts + 1>{});
         __builtin_amdgcn_sched_barrier(0);
@@ -472,7 +470,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_kernel(pa_ka
 
         // Cluster 3:
         __builtin_amdgcn_s_setprio(1);
-        compute_pv(v_p, v_v, v_o_slices, s_v[0]);
+        compute_pv(v_p, v_v, v_o_slices, 0_I);
         D_ACC row_max = attn_row_max<T>(v_s[1]);
         bool below_thresh = ((row_max - m_row) <= RESCALE_THRESHOLD);
         bool all_below = (__builtin_amdgcn_ballot_w64(below_thresh) == __builtin_amdgcn_read_exec());
@@ -494,11 +492,11 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_kernel(pa_ka
 
         // Cluster 4:
         s_waitcnt_vmcnt(number<T::v_buffer_load_insts>{});
-        async_load<T::VEC_KV>(g_k, s_k[1].ptr, u_gkv + kv_token_offset(kv_page[2]), u_skv);
+        async_load<T::VEC_KV>(g_k, s_k.ptr, u_gkv + kv_token_offset(kv_page[2]), u_skv + sk_slot_offset);
         __builtin_amdgcn_sched_barrier(0);
         kv_page[3] = load_kv_page(j + 3);
-        v_k[0] = load<T::VEC_KV>(s_k[0], u_rk);
-        v_k[1] = load<T::VEC_KV>(s_k[0], u_rk + skv_slice(1_I));
+        v_k[0] = load<T::VEC_KV>(s_k, u_rk);
+        v_k[1] = load<T::VEC_KV>(s_k, u_rk + skv_slice(1_I));
         s_waitcnt_lgkmcnt(number<T::k_ds_read_insts>{});
         s_waitcnt_vmcnt(number<T::k_buffer_load_insts + 1>{});
         __builtin_amdgcn_sched_barrier(0);
@@ -507,7 +505,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_kernel(pa_ka
 
         // Cluster 5:
         __builtin_amdgcn_s_setprio(1);
-        compute_qk(v_s[0], v_q_slices, v_k, s_k[0]);
+        compute_qk(v_s[0], v_q_slices, v_k, 0_I);
         attn_exp2_slice<T, s_half_len, s_half_len>(v_s[1]);
         l_row += attn_row_sum<T>(v_s[1]);
         v_p = opus::cast<D_ATTN>(v_s[1]);
@@ -519,9 +517,9 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_kernel(pa_ka
         __builtin_amdgcn_sched_barrier(0);
 
         // Cluster 6:
-        async_load<T::VEC_KV>(g_v, s_v[0].ptr, u_gkv + kv_token_offset(kv_page[1]), u_skv);
-        v_v[0] = tr_load<T::VEC_TR_V>(s_v[1], u_rv);
-        v_v[1] = tr_load<T::VEC_TR_V>(s_v[1], u_rv + skv_slice(1_I));
+        async_load<T::VEC_KV>(g_v, s_v.ptr, u_gkv + kv_token_offset(kv_page[1]), u_skv);
+        v_v[0] = tr_load<T::VEC_TR_V>(s_v, u_rv + sv_slot_offset);
+        v_v[1] = tr_load<T::VEC_TR_V>(s_v, u_rv + sv_slot_offset + skv_slice(1_I));
         s_waitcnt_lgkmcnt(number<T::v_ds_read_insts>{});
         s_waitcnt_vmcnt(number<T::v_buffer_load_insts + 1>{});
         __builtin_amdgcn_sched_barrier(0);
@@ -530,7 +528,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_kernel(pa_ka
 
         // Cluster 7:
         __builtin_amdgcn_s_setprio(1);
-        compute_pv(v_p, v_v, v_o_slices, s_v[1]);
+        compute_pv(v_p, v_v, v_o_slices, sv_slot_offset);
         row_max = attn_row_max<T>(v_s[0]);
         below_thresh = ((row_max - m_row) <= RESCALE_THRESHOLD);
         all_below = (__builtin_amdgcn_ballot_w64(below_thresh) == __builtin_amdgcn_read_exec());
@@ -557,11 +555,11 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_kernel(pa_ka
     // Epilogue
     // Cluster 0:
     s_waitcnt_vmcnt(number<T::v_buffer_load_insts>{});
-    async_load<T::VEC_KV>(g_k, s_k[0].ptr, u_gkv + kv_token_offset(kv_page[1]), u_skv);
+    async_load<T::VEC_KV>(g_k, s_k.ptr, u_gkv + kv_token_offset(kv_page[1]), u_skv);
     __builtin_amdgcn_sched_barrier(0);
     kv_page[2] = load_kv_page(num_kv_tiles - 1);
-    v_k[0] = load<T::VEC_KV>(s_k[1], u_rk);
-    v_k[1] = load<T::VEC_KV>(s_k[1], u_rk + skv_slice(1_I));
+    v_k[0] = load<T::VEC_KV>(s_k, u_rk + sk_slot_offset);
+    v_k[1] = load<T::VEC_KV>(s_k, u_rk + sk_slot_offset + skv_slice(1_I));
     s_waitcnt_lgkmcnt(number<T::k_ds_read_insts>{});
     s_waitcnt_vmcnt(number<T::k_buffer_load_insts + 1>{});
     __builtin_amdgcn_sched_barrier(0);
@@ -570,7 +568,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_kernel(pa_ka
 
     // Cluster 1:
     __builtin_amdgcn_s_setprio(1);
-    compute_qk(v_s[1], v_q_slices, v_k, s_k[1]);
+    compute_qk(v_s[1], v_q_slices, v_k, sk_slot_offset);
     attn_exp2_slice<T, s_half_len, s_half_len>(v_s[0]);
     l_row += attn_row_sum<T>(v_s[0]);
     v_p = opus::cast<D_ATTN>(v_s[0]);
@@ -582,9 +580,9 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_kernel(pa_ka
     __builtin_amdgcn_sched_barrier(0);
 
     // Cluster 2:
-    async_load<T::VEC_KV>(g_v, s_v[1].ptr, u_gkv + kv_token_offset(kv_page[0]), u_skv);
-    v_v[0] = tr_load<T::VEC_TR_V>(s_v[0], u_rv);
-    v_v[1] = tr_load<T::VEC_TR_V>(s_v[0], u_rv + skv_slice(1_I));
+    async_load<T::VEC_KV>(g_v, s_v.ptr, u_gkv + kv_token_offset(kv_page[0]), u_skv + sv_slot_offset);
+    v_v[0] = tr_load<T::VEC_TR_V>(s_v, u_rv);
+    v_v[1] = tr_load<T::VEC_TR_V>(s_v, u_rv + skv_slice(1_I));
     s_waitcnt_lgkmcnt(number<T::v_ds_read_insts>{});
     s_waitcnt_vmcnt(number<T::v_buffer_load_insts + 1>{});
     __builtin_amdgcn_sched_barrier(0);
@@ -593,7 +591,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_kernel(pa_ka
 
     // Cluster 3:
     __builtin_amdgcn_s_setprio(1);
-    compute_pv(v_p, v_v, v_o_slices, s_v[0]);
+    compute_pv(v_p, v_v, v_o_slices, 0_I);
     D_ACC row_max = max(m_row, attn_row_max<T>(v_s[1]));
     rescale_m = __builtin_amdgcn_exp2f(m_row - row_max);
     m_row = row_max;
@@ -610,9 +608,9 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_kernel(pa_ka
 
     // Cluster 4:
     s_waitcnt_vmcnt(number<T::v_buffer_load_insts>{});
-    async_load<T::VEC_KV>(g_k, s_k[1].ptr, u_gkv + kv_token_offset(kv_page[2]), u_skv);
-    v_k[0] = load<T::VEC_KV>(s_k[0], u_rk);
-    v_k[1] = load<T::VEC_KV>(s_k[0], u_rk + skv_slice(1_I));
+    async_load<T::VEC_KV>(g_k, s_k.ptr, u_gkv + kv_token_offset(kv_page[2]), u_skv + sk_slot_offset);
+    v_k[0] = load<T::VEC_KV>(s_k, u_rk);
+    v_k[1] = load<T::VEC_KV>(s_k, u_rk + skv_slice(1_I));
     s_waitcnt_lgkmcnt(number<T::k_ds_read_insts>{});
     s_waitcnt_vmcnt(number<T::k_buffer_load_insts>{});
     __builtin_amdgcn_sched_barrier(0);
@@ -621,7 +619,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_kernel(pa_ka
 
     // Cluster 5:
     __builtin_amdgcn_s_setprio(1);
-    compute_qk(v_s[0], v_q_slices, v_k, s_k[0]);
+    compute_qk(v_s[0], v_q_slices, v_k, 0_I);
     l_row *= rescale_m;
     attn_exp2_slice<T, s_half_len, s_half_len>(v_s[1]);
     l_row += attn_row_sum<T>(v_s[1]);
@@ -634,9 +632,9 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_kernel(pa_ka
     __builtin_amdgcn_sched_barrier(0);
 
     // Cluster 6:
-    async_load<T::VEC_KV>(g_v, s_v[0].ptr, u_gkv + kv_token_offset(kv_page[1]), u_skv);
-    v_v[0] = tr_load<T::VEC_TR_V>(s_v[1], u_rv);
-    v_v[1] = tr_load<T::VEC_TR_V>(s_v[1], u_rv + skv_slice(1_I));
+    async_load<T::VEC_KV>(g_v, s_v.ptr, u_gkv + kv_token_offset(kv_page[1]), u_skv);
+    v_v[0] = tr_load<T::VEC_TR_V>(s_v, u_rv + sv_slot_offset);
+    v_v[1] = tr_load<T::VEC_TR_V>(s_v, u_rv + sv_slot_offset + skv_slice(1_I));
     s_waitcnt_lgkmcnt(number<T::v_ds_read_insts>{});
     s_waitcnt_vmcnt(number<T::v_buffer_load_insts>{});
     __builtin_amdgcn_sched_barrier(0);
@@ -645,7 +643,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_kernel(pa_ka
 
     // Cluster 7:
     __builtin_amdgcn_s_setprio(1);
-    compute_pv(v_p, v_v, v_o_slices, s_v[1]);
+    compute_pv(v_p, v_v, v_o_slices, sv_slot_offset);
     row_max = max(m_row, attn_row_max<T>(v_s[0]));
     rescale_m = __builtin_amdgcn_exp2f(m_row - row_max);
     m_row = row_max;
@@ -661,8 +659,8 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_kernel(pa_ka
     __builtin_amdgcn_sched_barrier(0);
 
     // Cluster 8:
-    v_k[0] = load<T::VEC_KV>(s_k[1], u_rk);
-    v_k[1] = load<T::VEC_KV>(s_k[1], u_rk + skv_slice(1_I));
+    v_k[0] = load<T::VEC_KV>(s_k, u_rk + sk_slot_offset);
+    v_k[1] = load<T::VEC_KV>(s_k, u_rk + sk_slot_offset + skv_slice(1_I));
     s_waitcnt_lgkmcnt(number<T::k_ds_read_insts>{});
     s_waitcnt_vmcnt(number<T::v_buffer_load_insts>{});
     __builtin_amdgcn_sched_barrier(0);
@@ -671,7 +669,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_kernel(pa_ka
 
     // Cluster 9:
     __builtin_amdgcn_s_setprio(1);
-    compute_qk(v_s[1], v_q_slices, v_k, s_k[1]);
+    compute_qk(v_s[1], v_q_slices, v_k, sk_slot_offset);
     l_row *= rescale_m;
     attn_exp2_slice<T, s_half_len, s_half_len>(v_s[0]);
     l_row += attn_row_sum<T>(v_s[0]);
@@ -684,9 +682,9 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_kernel(pa_ka
     __builtin_amdgcn_sched_barrier(0);
 
     // Cluster 10:
-    async_load<T::VEC_KV>(g_v, s_v[1].ptr, u_gkv + kv_token_offset(kv_page[2]), u_skv);
-    v_v[0] = tr_load<T::VEC_TR_V>(s_v[0], u_rv);
-    v_v[1] = tr_load<T::VEC_TR_V>(s_v[0], u_rv + skv_slice(1_I));
+    async_load<T::VEC_KV>(g_v, s_v.ptr, u_gkv + kv_token_offset(kv_page[2]), u_skv + sv_slot_offset);
+    v_v[0] = tr_load<T::VEC_TR_V>(s_v, u_rv);
+    v_v[1] = tr_load<T::VEC_TR_V>(s_v, u_rv + skv_slice(1_I));
     s_waitcnt_lgkmcnt(number<T::v_ds_read_insts>{});
     s_waitcnt_vmcnt(0_I);
     __builtin_amdgcn_sched_barrier(0);
@@ -695,7 +693,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_kernel(pa_ka
 
     // Cluster 11:
     __builtin_amdgcn_s_setprio(1);
-    compute_pv(v_p, v_v, v_o_slices, s_v[0]);
+    compute_pv(v_p, v_v, v_o_slices, 0_I);
     row_max = max(m_row, attn_row_max<T>(v_s[1]));
     rescale_m = __builtin_amdgcn_exp2f(m_row - row_max);
     m_row = row_max;
@@ -717,15 +715,15 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_kernel(pa_ka
     __builtin_amdgcn_sched_barrier(0);
 
     // Cluster 12:
-    v_v[0] = tr_load<T::VEC_TR_V>(s_v[1], u_rv);
-    v_v[1] = tr_load<T::VEC_TR_V>(s_v[1], u_rv + skv_slice(1_I));
+    v_v[0] = tr_load<T::VEC_TR_V>(s_v, u_rv + sv_slot_offset);
+    v_v[1] = tr_load<T::VEC_TR_V>(s_v, u_rv + sv_slot_offset + skv_slice(1_I));
     s_waitcnt_lgkmcnt(number<T::v_ds_read_insts>{});
     __builtin_amdgcn_sched_barrier(0);
     __builtin_amdgcn_s_barrier();
     __builtin_amdgcn_sched_barrier(0);
 
     // Cluster 13:
-    compute_pv(v_p, v_v, v_o_slices, s_v[1]);
+    compute_pv(v_p, v_v, v_o_slices, sv_slot_offset);
 
     // ──── Normalize O and store to gmem ────
     D_ACC l_inv = (l_row > D_ACC(0.0f)) ? (D_ACC(1.0f) / l_row) : D_ACC(0.0f);
