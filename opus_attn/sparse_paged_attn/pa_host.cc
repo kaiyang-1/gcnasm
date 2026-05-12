@@ -308,11 +308,6 @@ int main(int argc, char** argv) {
             std::cerr << "This kernel only supports head dimension D=" << PATraits::D_TILE_SIZE << ", got D=" << D << "\n";
             return 1;
         }
-        if ((total_pages % PATraits::KV_TILE_SIZE) != 0 || (total_pages / PATraits::KV_TILE_SIZE) < 6) {
-            std::cerr << "This attend-style pipeline requires total_pages to be a multiple of "
-                      << PATraits::KV_TILE_SIZE << " and span at least 6 KV tiles, got total_pages=" << total_pages << "\n";
-            return 1;
-        }
         if ((H % (PATraits::Q_TILE_SIZE * PATraits::NUM_WARPS)) != 0) {
             std::cerr << "This kernel requires H to be a multiple of "
                       << (PATraits::Q_TILE_SIZE * PATraits::NUM_WARPS)
