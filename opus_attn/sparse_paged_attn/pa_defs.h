@@ -9,8 +9,10 @@ struct pa_kargs {
     const void* __restrict__ ptr_k;  // [total_pages, D]
     const void* __restrict__ ptr_v;  // [total_pages, D]
     void* __restrict__ ptr_o;        // [N, H, D]
-    const int* __restrict__ kv_indptr;  // [N+1]
-    const int* __restrict__ kv_indices; // [indices_prefix_sum]
+    const int* __restrict__ kv_indptr_prefix;  // [N+1]
+    const int* __restrict__ kv_indices_prefix; // [indices_prefix_sum_prefix]
+    const int* __restrict__ kv_indptr_extend;  // [N+1]
+    const int* __restrict__ kv_indices_extend; // [indices_prefix_sum_extend]
     int N;
     int H;
     int D;

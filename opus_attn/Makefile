@@ -1,4 +1,4 @@
-OPUS_INCLUDE_DIR ?= /home/carhuang/repo/aiter/csrc/include
+OPUS_INCLUDE_DIR ?= /home/kaiyang1/develop/aiter/csrc/include
 HIPCC           ?= /opt/rocm/bin/hipcc
 ARCH            ?= gfx950
 

@@ -54,7 +54,8 @@ void init_sparse_kv_indices(std::vector<int>& kv_indptr,
                             std::vector<int>& kv_indices,
                             int N,
                             int total_pages,
-                            int kv_tile_size) {
+                            int kv_tile_size,
+                            uint32_t seed = 1234) {
     assert(N >= 0);
     assert(total_pages > 0);
     assert(kv_tile_size > 0);
@@ -62,7 +63,7 @@ void init_sparse_kv_indices(std::vector<int>& kv_indptr,
     kv_indptr.assign(N + 1, 0);
     kv_indices.clear();
 
-    std::mt19937 gen(1234);
+    std::mt19937 gen(seed);
     std::vector<int> pages(total_pages);
     std::iota(pages.begin(), pages.end(), 0);
 
@@ -212,8 +213,10 @@ void pa_attention_ref(
     const bf16_t* K,  // [total_pages, D]
     const bf16_t* V,  // [total_pages, D]
     bf16_t*       O,  // [N, H, D]
-    const int* kv_indptr,
-    const int* kv_indices,
+    const int* kv_indptr_prefix,
+    const int* kv_indices_prefix,
+    const int* kv_indptr_extend,
+    const int* kv_indices_extend,
     int N, int H, int D)
 {
     const float scale = 1.0f / std::sqrt(static_cast<float>(D));
@@ -227,9 +230,13 @@ void pa_attention_ref(
     for (int h = 0; h < H; h++) {
         for (int i = 0; i < N; i++) {
             const bf16_t* q_row = Q + i * stride_qo_n + h * stride_qo_h;
-            const int row_begin = kv_indptr[i];
-            const int row_end = kv_indptr[i + 1];
-            const int num_rows = row_end - row_begin;
+            const int prefix_begin = kv_indptr_prefix[i];
+            const int prefix_end = kv_indptr_prefix[i + 1];
+            const int extend_begin = kv_indptr_extend[i];
+            const int extend_end = kv_indptr_extend[i + 1];
+            const int num_prefix = prefix_end - prefix_begin;
+            const int num_extend = extend_end - extend_begin;
+            const int num_rows = num_prefix + num_extend;
 
             if (num_rows <= 0) {
                 bf16_t* o_row = O + i * stride_qo_n + h * stride_qo_h;
@@ -241,14 +248,23 @@ void pa_attention_ref(
 
             // ---- Compute attention scores S[p] = Q[i,h,:] . K[kv_indices[p],:] ----
             std::vector<float> scores(num_rows);
-            for (int p = 0; p < num_rows; p++) {
-                const int kv_row = kv_indices[row_begin + p];
+            for (int p = 0; p < num_prefix; p++) {
+                const int kv_row = kv_indices_prefix[prefix_begin + p];
                 const bf16_t* k_row = K + kv_row * stride_kv_page;
                 float dot = 0.0f;
                 for (int d = 0; d < D; d++) {
                     dot += static_cast<float>(q_row[d] * k_row[d]);
                 }
                 scores[p] = dot * scale;
+            }
+            for (int p = 0; p < num_extend; p++) {
+                const int kv_row = kv_indices_extend[extend_begin + p];
+                const bf16_t* k_row = K + kv_row * stride_kv_page;
+                float dot = 0.0f;
+                for (int d = 0; d < D; d++) {
+                    dot += static_cast<float>(q_row[d] * k_row[d]);
+                }
+                scores[num_prefix + p] = dot * scale;
             }
 
             // ---- Softmax ----
@@ -270,10 +286,15 @@ void pa_attention_ref(
             bf16_t* o_row = O + i * stride_qo_n + h * stride_qo_h;
             for (int d = 0; d < D; d++) {
                 float acc = 0.0f;
-                for (int p = 0; p < num_rows; p++) {
-                    const int kv_row = kv_indices[row_begin + p];
+                for (int p = 0; p < num_prefix; p++) {
+                    const int kv_row = kv_indices_prefix[prefix_begin + p];
                     const bf16_t* v_row = V + kv_row * stride_kv_page;
                     acc += static_cast<float>(p_row[p] * v_row[d]);
+                }
+                for (int p = 0; p < num_extend; p++) {
+                    const int kv_row = kv_indices_extend[extend_begin + p];
+                    const bf16_t* v_row = V + kv_row * stride_kv_page;
+                    acc += static_cast<float>(p_row[num_prefix + p] * v_row[d]);
                 }
                 o_row[d] = static_cast<bf16_t>(acc);
             }
@@ -335,41 +356,60 @@ int main(int argc, char** argv) {
     auto host_v = std::make_unique<bf16_t[]>(kv_size);
     auto host_o_ref = std::make_unique<bf16_t[]>(q_size);
     auto host_o_gpu = std::make_unique<bf16_t[]>(q_size);
-    std::vector<int> host_kv_indptr;
-    std::vector<int> host_kv_indices;
+    std::vector<int> host_kv_indptr_prefix;
+    std::vector<int> host_kv_indices_prefix;
+    std::vector<int> host_kv_indptr_extend;
+    std::vector<int> host_kv_indices_extend;
 
     // Initialize with random data
     rand_vector(host_q.get(), q_size, -2.f, 2.f);
     rand_vector(host_k.get(), kv_size, -2.f, 2.f);
     rand_vector(host_v.get(), kv_size, -2.f, 2.f);
     if (dense_kv) {
-        init_dense_kv_indices(host_kv_indptr, host_kv_indices, N, total_pages);
+        init_dense_kv_indices(host_kv_indptr_prefix, host_kv_indices_prefix, N, total_pages);
+        init_dense_kv_indices(host_kv_indptr_extend, host_kv_indices_extend, N, total_pages);
     } else {
-        init_sparse_kv_indices(host_kv_indptr,
-                               host_kv_indices,
+        init_sparse_kv_indices(host_kv_indptr_prefix,
+                               host_kv_indices_prefix,
                                N,
                                total_pages,
-                               pa_traits<16, 32, 512, 8>::KV_TILE_SIZE);
+                               pa_traits<16, 32, 512, 8>::KV_TILE_SIZE,
+                               1234);
+        init_sparse_kv_indices(host_kv_indptr_extend,
+                               host_kv_indices_extend,
+                               N,
+                               total_pages,
+                               pa_traits<16, 32, 512, 8>::KV_TILE_SIZE,
+                               5678);
     }
-    const int indices_prefix_sum = static_cast<int>(host_kv_indices.size());
+    const size_t total_kv_indices = host_kv_indices_prefix.size() + host_kv_indices_extend.size();
+    assert(total_kv_indices <= static_cast<size_t>(std::numeric_limits<int>::max()));
+    const int indices_prefix_sum = static_cast<int>(total_kv_indices);
 
     // Allocate device memory
     bf16_t *dev_q, *dev_k, *dev_v, *dev_o;
-    int *dev_kv_indptr, *dev_kv_indices;
-    const size_t kv_indices_alloc_size = std::max<size_t>(host_kv_indices.size(), 1);
+    int *dev_kv_indptr_prefix, *dev_kv_indices_prefix, *dev_kv_indptr_extend, *dev_kv_indices_extend;
+    const size_t kv_indices_prefix_alloc_size = std::max<size_t>(host_kv_indices_prefix.size(), 1);
+    const size_t kv_indices_extend_alloc_size = std::max<size_t>(host_kv_indices_extend.size(), 1);
     CHECK_HIP(hipMalloc(&dev_q, q_size * sizeof(bf16_t)));
     CHECK_HIP(hipMalloc(&dev_k, kv_size * sizeof(bf16_t)));
     CHECK_HIP(hipMalloc(&dev_v, kv_size * sizeof(bf16_t)));
     CHECK_HIP(hipMalloc(&dev_o, q_size * sizeof(bf16_t)));
-    CHECK_HIP(hipMalloc(&dev_kv_indptr, host_kv_indptr.size() * sizeof(int)));
-    CHECK_HIP(hipMalloc(&dev_kv_indices, kv_indices_alloc_size * sizeof(int)));
+    CHECK_HIP(hipMalloc(&dev_kv_indptr_prefix, host_kv_indptr_prefix.size() * sizeof(int)));
+    CHECK_HIP(hipMalloc(&dev_kv_indices_prefix, kv_indices_prefix_alloc_size * sizeof(int)));
+    CHECK_HIP(hipMalloc(&dev_kv_indptr_extend, host_kv_indptr_extend.size() * sizeof(int)));
+    CHECK_HIP(hipMalloc(&dev_kv_indices_extend, kv_indices_extend_alloc_size * sizeof(int)));
 
     CHECK_HIP(hipMemcpy(dev_q, host_q.get(), q_size * sizeof(bf16_t), hipMemcpyHostToDevice));
     CHECK_HIP(hipMemcpy(dev_k, host_k.get(), kv_size * sizeof(bf16_t), hipMemcpyHostToDevice));
     CHECK_HIP(hipMemcpy(dev_v, host_v.get(), kv_size * sizeof(bf16_t), hipMemcpyHostToDevice));
-    CHECK_HIP(hipMemcpy(dev_kv_indptr, host_kv_indptr.data(), host_kv_indptr.size() * sizeof(int), hipMemcpyHostToDevice));
-    if (!host_kv_indices.empty()) {
-        CHECK_HIP(hipMemcpy(dev_kv_indices, host_kv_indices.data(), host_kv_indices.size() * sizeof(int), hipMemcpyHostToDevice));
+    CHECK_HIP(hipMemcpy(dev_kv_indptr_prefix, host_kv_indptr_prefix.data(), host_kv_indptr_prefix.size() * sizeof(int), hipMemcpyHostToDevice));
+    CHECK_HIP(hipMemcpy(dev_kv_indptr_extend, host_kv_indptr_extend.data(), host_kv_indptr_extend.size() * sizeof(int), hipMemcpyHostToDevice));
+    if (!host_kv_indices_prefix.empty()) {
+        CHECK_HIP(hipMemcpy(dev_kv_indices_prefix, host_kv_indices_prefix.data(), host_kv_indices_prefix.size() * sizeof(int), hipMemcpyHostToDevice));
+    }
+    if (!host_kv_indices_extend.empty()) {
+        CHECK_HIP(hipMemcpy(dev_kv_indices_extend, host_kv_indices_extend.data(), host_kv_indices_extend.size() * sizeof(int), hipMemcpyHostToDevice));
     }
 
     // Setup kernel arguments
@@ -378,8 +418,10 @@ int main(int argc, char** argv) {
     kargs.ptr_k = dev_k;
     kargs.ptr_v = dev_v;
     kargs.ptr_o = dev_o;
-    kargs.kv_indptr = dev_kv_indptr;
-    kargs.kv_indices = dev_kv_indices;
+    kargs.kv_indptr_prefix = dev_kv_indptr_prefix;
+    kargs.kv_indices_prefix = dev_kv_indices_prefix;
+    kargs.kv_indptr_extend = dev_kv_indptr_extend;
+    kargs.kv_indices_extend = dev_kv_indices_extend;
     kargs.N = N;
     kargs.H = H;
     kargs.D = D;
@@ -415,7 +457,9 @@ int main(int argc, char** argv) {
             printf("\nValidating GPU results against CPU reference...\n");
             CHECK_HIP(hipMemcpy(host_o_gpu.get(), dev_o, q_size * sizeof(bf16_t), hipMemcpyDeviceToHost));
             pa_attention_ref(host_q.get(), host_k.get(), host_v.get(), host_o_ref.get(),
-                              host_kv_indptr.data(), host_kv_indices.data(), N, H, D);
+                              host_kv_indptr_prefix.data(), host_kv_indices_prefix.data(),
+                              host_kv_indptr_extend.data(), host_kv_indices_extend.data(),
+                              N, H, D);
 
             bool all_valid = validate_pa_results(host_o_ref.get(), host_o_gpu.get(), N, H, D);
             printf("\n[Overall] %s\n", all_valid ? "✓ GPU KERNEL VALID" : "✗ GPU KERNEL FAILED");
@@ -442,8 +486,10 @@ int main(int argc, char** argv) {
     CHECK_HIP(hipFree(dev_k));
     CHECK_HIP(hipFree(dev_v));
     CHECK_HIP(hipFree(dev_o));
-    CHECK_HIP(hipFree(dev_kv_indptr));
-    CHECK_HIP(hipFree(dev_kv_indices));
+    CHECK_HIP(hipFree(dev_kv_indptr_prefix));
+    CHECK_HIP(hipFree(dev_kv_indices_prefix));
+    CHECK_HIP(hipFree(dev_kv_indptr_extend));
+    CHECK_HIP(hipFree(dev_kv_indices_extend));
 
     return 0;
 }

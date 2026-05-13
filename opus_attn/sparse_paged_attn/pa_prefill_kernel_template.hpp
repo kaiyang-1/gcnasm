@@ -329,24 +329,25 @@ __device__ inline void attn_mask_oob_kv_tile(V& v_s, int valid_kv_len, int kv_ti
 }
 
 template<class Traits>
-__device__ void pa_prefill_le2_tiles_kernel_impl(pa_kargs kargs, int q_token_idx, int h_block_idx, int page_idx_begin, int valid_kv_len, int num_kv_tiles,
-                                                 char* smem_k_buf, char* smem_v_buf) {
+__device__ void pa_prefill_accum_le2_tiles(pa_kargs kargs,
+                                           const int* kv_indices, int page_idx_begin, int valid_kv_len, int num_kv_tiles,
+                                           char* smem_k_buf, char* smem_v_buf,
+                                           opus::vector_t<typename Traits::D_ATTN, Traits::Q_TILE_SIZE * Traits::D_TILE_SIZE / Traits::WARP_SIZE>& v_q,
+                                           opus::vector_t<typename Traits::D_ACC,  Traits::Q_TILE_SIZE * Traits::D_TILE_SIZE / Traits::WARP_SIZE>& v_o,
+                                           typename Traits::D_ACC& m_row,
+                                           typename Traits::D_ACC& l_row) {
     using namespace opus;
     using T = opus::remove_cvref_t<Traits>;
     using D_ATTN = typename T::D_ATTN;
     using D_ACC = typename T::D_ACC;
 
-    const int lane_id = thread_id_x() % T::WARP_SIZE;
+    int lane_id = thread_id_x() % T::WARP_SIZE;
+    asm volatile("" : "+v"(lane_id));  // break CSE
     const int warp_id = __builtin_amdgcn_readfirstlane(thread_id_x() / T::WARP_SIZE);
 
-    const int h_block_start = h_block_idx * T::NUM_WARPS * T::Q_TILE_SIZE;
-    const int qo_gmem_offset = q_token_idx * kargs.stride_qo_n + h_block_start * kargs.stride_qo_h;
-
-    auto g_q = make_gmem(reinterpret_cast<const D_ATTN*>(kargs.ptr_q) + qo_gmem_offset);
     auto g_k = make_gmem(reinterpret_cast<const D_ATTN*>(kargs.ptr_k), kargs.total_pages * kargs.stride_kv_page * sizeof(D_ATTN));
     auto g_v = make_gmem(reinterpret_cast<const D_ATTN*>(kargs.ptr_v), kargs.total_pages * kargs.stride_kv_page * sizeof(D_ATTN));
-    auto g_o = make_gmem(reinterpret_cast<D_ATTN*>(kargs.ptr_o) + qo_gmem_offset);
-    auto g_kv_indices = make_gmem(kargs.kv_indices + page_idx_begin, valid_kv_len * sizeof(int));
+    auto g_kv_indices = make_gmem(kv_indices + page_idx_begin, valid_kv_len * sizeof(int));
 
     auto s_k = make_smem(reinterpret_cast<D_ATTN*>(smem_k_buf));
     auto s_v = make_smem(reinterpret_cast<D_ATTN*>(smem_v_buf));
@@ -362,7 +363,6 @@ __device__ void pa_prefill_le2_tiles_kernel_impl(pa_kargs kargs, int q_token_idx
         seq<T::W_M, T::W_N, T::W_K>{},
         mfma_adaptor_swap_ab{});
 
-    auto u_q = make_layout_q<T>(warp_id, lane_id, kargs.stride_qo_h);
     auto u_gkv = make_layout_gk_gv<T>(warp_id, lane_id);
     auto u_skv = make_layout_sk_sv<T>(warp_id);
     auto u_rk = make_layout_rk<T>(lane_id);
@@ -373,21 +373,10 @@ __device__ void pa_prefill_le2_tiles_kernel_impl(pa_kargs kargs, int q_token_idx
     typename decltype(mma0)::vtype_c v_s;
     typename decltype(mma1)::vtype_a v_p;
     typename decltype(mma1)::vtype_b v_v[2];
-    vector_t<D_ATTN, T::Q_TILE_SIZE * T::D_TILE_SIZE / T::WARP_SIZE> v_q;
-    vector_t<D_ACC,  T::Q_TILE_SIZE * T::D_TILE_SIZE / T::WARP_SIZE> v_o;
     auto v_q_slices = reinterpret_cast<vector_t<D_ATTN, T::Q_TILE_SIZE * T::SLICE_D / T::WARP_SIZE>*>(&v_q);
     auto v_o_slices = reinterpret_cast<vector_t<D_ACC,  T::Q_TILE_SIZE * T::SLICE_D / T::WARP_SIZE>*>(&v_o);
 
-    clear(v_o);
-
-    constexpr index_t q_len = vector_traits<decltype(v_q)>::size();
     constexpr index_t s_len = vector_traits<typename decltype(mma0)::vtype_c>::size();
-    constexpr index_t o_len = vector_traits<decltype(v_o)>::size();
-    constexpr float LOG2_E = 1.44269504089f;
-    const float temperature_scale = (1.0f / sqrtf(static_cast<float>(kargs.D))) * LOG2_E;
-
-    D_ACC m_row = opus::numeric_limits<D_ACC>::lowest();
-    D_ACC l_row = 0.0f;
 
     auto load_kv_page = [&](int tile_idx) { return load(g_kv_indices, u_kv_indices, tile_idx * T::KV_TILE_SIZE)[0]; };
     auto kv_token_offset = [&](int token_idx) { return token_idx * kargs.stride_kv_page; };
@@ -432,11 +421,6 @@ __device__ void pa_prefill_le2_tiles_kernel_impl(pa_kargs kargs, int q_token_idx
         }
     };
 
-    v_q = load<T::VEC_Q>(g_q, u_q);
-    auto v_q_f32 = cast<float>(v_q);
-    static_for<q_len>([&](auto i) { v_q_f32[i.value] *= temperature_scale; });
-    v_q = cast<D_ATTN>(v_q_f32);
-
     for (int tile_idx = 0; tile_idx < num_kv_tiles; ++tile_idx) {
         const int kv_page = load_kv_page(tile_idx);
         async_load<T::VEC_KV>(g_k, s_k.ptr, u_gkv + kv_token_offset(kv_page), u_skv);
@@ -457,7 +441,6 @@ __device__ void pa_prefill_le2_tiles_kernel_impl(pa_kargs kargs, int q_token_idx
         l_row *= rescale_m;
         l_row += attn_row_sum<T>(v_s);
         v_p = cast<D_ATTN>(v_s);
-        asm volatile("" : "+v"(v_p) ::);
         scale_output_tile<T>(v_o, rescale_m);
 
         async_load<T::VEC_KV>(g_v, s_v.ptr, u_gkv + kv_token_offset(kv_page), u_skv);
@@ -469,36 +452,30 @@ __device__ void pa_prefill_le2_tiles_kernel_impl(pa_kargs kargs, int q_token_idx
         s_waitcnt_lgkmcnt(number<T::v_ds_read_insts>{});
         compute_pv(v_p, v_v, v_o_slices);
     }
-
-    D_ACC l_inv = (l_row > D_ACC(0.0f)) ? (D_ACC(1.0f) / l_row) : D_ACC(0.0f);
-    static_for<o_len>([&](auto i) { v_o[i.value] *= l_inv; });
-
-    auto u_o = make_layout_o<T>(warp_id, lane_id, kargs.stride_qo_h);
-    auto v_o_bf16 = cast<D_ATTN>(v_o);
-    store<T::VEC_O>(g_o, v_o_bf16, u_o);
 }
 
 template<class Traits, bool OddTail>
-__device__ void pa_prefill_kernel_impl(pa_kargs kargs, int q_token_idx, int h_block_idx, int page_idx_begin, int valid_kv_len, int num_kv_tiles,
-                                       char* smem_k_buf, char* smem_v_buf) {
+__device__ void pa_prefill_accum_pipelined(pa_kargs kargs,
+                                           const int* kv_indices, int page_idx_begin, int valid_kv_len, int num_kv_tiles,
+                                           char* smem_k_buf, char* smem_v_buf,
+                                           opus::vector_t<typename Traits::D_ATTN, Traits::Q_TILE_SIZE * Traits::D_TILE_SIZE / Traits::WARP_SIZE>& v_q,
+                                           opus::vector_t<typename Traits::D_ACC,  Traits::Q_TILE_SIZE * Traits::D_TILE_SIZE / Traits::WARP_SIZE>& v_o,
+                                           typename Traits::D_ACC& m_row,
+                                           typename Traits::D_ACC& l_row) {
     using namespace opus;
     using T = opus::remove_cvref_t<Traits>;
     using D_ATTN = typename T::D_ATTN;
     using D_ACC = typename T::D_ACC;
 
-    const int lane_id = thread_id_x() % T::WARP_SIZE;
+    int lane_id = thread_id_x() % T::WARP_SIZE;
+    asm volatile("" : "+v"(lane_id));  // break CSE
     const int warp_id = __builtin_amdgcn_readfirstlane(thread_id_x() / T::WARP_SIZE);
     const int stagger = warp_id / 4;
 
-    const int h_block_start = h_block_idx * T::NUM_WARPS * T::Q_TILE_SIZE;
-    const int qo_gmem_offset = q_token_idx * kargs.stride_qo_n + h_block_start * kargs.stride_qo_h;
-
     // Global memory tensors
-    auto g_q = make_gmem(reinterpret_cast<const D_ATTN*>(kargs.ptr_q) + qo_gmem_offset);
     auto g_k = make_gmem(reinterpret_cast<const D_ATTN*>(kargs.ptr_k), kargs.total_pages * kargs.stride_kv_page * sizeof(D_ATTN));
     auto g_v = make_gmem(reinterpret_cast<const D_ATTN*>(kargs.ptr_v), kargs.total_pages * kargs.stride_kv_page * sizeof(D_ATTN));
-    auto g_o = make_gmem(reinterpret_cast<D_ATTN*>(kargs.ptr_o) + qo_gmem_offset);
-    auto g_kv_indices = make_gmem(kargs.kv_indices + page_idx_begin, valid_kv_len * sizeof(int));
+    auto g_kv_indices = make_gmem(kv_indices + page_idx_begin, valid_kv_len * sizeof(int));
 
     // Shared memory for K and V tiles
     auto s_k = make_smem(reinterpret_cast<D_ATTN*>(smem_k_buf));
@@ -520,7 +497,6 @@ __device__ void pa_prefill_kernel_impl(pa_kargs kargs, int q_token_idx, int h_bl
         mfma_adaptor_swap_ab{});
 
     // Partition layouts
-    auto u_q  = make_layout_q<T>(warp_id, lane_id, kargs.stride_qo_h);
     auto u_gkv = make_layout_gk_gv<T>(warp_id, lane_id);
     auto u_skv = make_layout_sk_sv<T>(warp_id);
     auto u_rk = make_layout_rk<T>(lane_id);
@@ -532,26 +508,15 @@ __device__ void pa_prefill_kernel_impl(pa_kargs kargs, int q_token_idx, int h_bl
     typename decltype(mma0)::vtype_c v_s[2];
     typename decltype(mma1)::vtype_a v_p;
     typename decltype(mma1)::vtype_b v_v[2];
-    vector_t<D_ATTN, T::Q_TILE_SIZE * T::D_TILE_SIZE / T::WARP_SIZE> v_q;
-    vector_t<D_ACC,  T::Q_TILE_SIZE * T::D_TILE_SIZE / T::WARP_SIZE> v_o;
     auto v_q_slices = reinterpret_cast<vector_t<D_ATTN, T::Q_TILE_SIZE * T::SLICE_D / T::WARP_SIZE>*>(&v_q);
     auto v_o_slices = reinterpret_cast<vector_t<D_ACC,  T::Q_TILE_SIZE * T::SLICE_D / T::WARP_SIZE>*>(&v_o);
 
-    clear(v_o);
-
     // Vector sizes
-    constexpr index_t q_len = vector_traits<decltype(v_q)>::size();
     constexpr index_t s_len = vector_traits<typename decltype(mma0)::vtype_c>::size();
     constexpr index_t s_half_len = s_len / 2;
-    constexpr index_t o_len = vector_traits<decltype(v_o)>::size();
 
     // Scaling constants and online softmax state
     constexpr D_ACC RESCALE_THRESHOLD = D_ACC(8.0f);
-    constexpr float LOG2_E = 1.44269504089f;
-    const float temperature_scale = (1.0f / sqrtf(static_cast<float>(kargs.D))) * LOG2_E;
-
-    D_ACC m_row = opus::numeric_limits<D_ACC>::lowest();
-    D_ACC l_row = 0.0f;
     D_ACC rescale_m = 1.0f;
 
     // Tile traversal helpers
@@ -607,11 +572,6 @@ __device__ void pa_prefill_kernel_impl(pa_kargs kargs, int q_token_idx, int h_bl
     __builtin_amdgcn_sched_barrier(0);
     __builtin_amdgcn_s_barrier();
 
-    v_q = load<T::VEC_Q>(g_q, u_q);
-    auto v_q_f32 = cast<float>(v_q);
-    static_for<q_len>([&](auto i) { v_q_f32[i.value] *= temperature_scale; });
-    v_q = cast<D_ATTN>(v_q_f32);
-
     kv_page[0] = load_kv_page(1);
     async_load<T::VEC_KV>(g_k, s_k.ptr, u_gkv + kv_token_offset(kv_page[0]), u_skv + sk_slot_offset);
     kv_page[1] = load_kv_page(2);
@@ -629,8 +589,18 @@ __device__ void pa_prefill_kernel_impl(pa_kargs kargs, int q_token_idx, int h_bl
         __builtin_amdgcn_s_barrier();
     }
 
-    m_row = attn_row_max<T>(v_s[0]);
-    attn_sub_row<T>(v_s[0], m_row);
+    D_ACC row_max = attn_row_max<T>(v_s[0]);
+    bool below_thresh = ((row_max - m_row) <= RESCALE_THRESHOLD);
+    bool all_below = (__builtin_amdgcn_ballot_w64(below_thresh) == __builtin_amdgcn_read_exec());
+    if (__builtin_expect(all_below, 1)) {
+        row_max = m_row;
+    } else {
+        rescale_m = __builtin_amdgcn_exp2f(m_row - row_max);
+        scale_output_tile<T>(v_o, rescale_m);
+        l_row *= rescale_m;
+        m_row = row_max;
+    }
+    attn_sub_row<T>(v_s[0], row_max);
     attn_exp2_slice<T, 0, s_half_len>(v_s[0]);
     asm volatile("" : "+v"(v_s[0]) ::);
     __builtin_amdgcn_sched_barrier(0);
@@ -678,9 +648,9 @@ __device__ void pa_prefill_kernel_impl(pa_kargs kargs, int q_token_idx, int h_bl
         // Cluster 3:
         __builtin_amdgcn_s_setprio(1);
         compute_pv(v_p, v_v, v_o_slices, 0_I);
-        D_ACC row_max = attn_row_max<T>(v_s[1]);
-        bool below_thresh = ((row_max - m_row) <= RESCALE_THRESHOLD);
-        bool all_below = (__builtin_amdgcn_ballot_w64(below_thresh) == __builtin_amdgcn_read_exec());
+        row_max = attn_row_max<T>(v_s[1]);
+        below_thresh = ((row_max - m_row) <= RESCALE_THRESHOLD);
+        all_below = (__builtin_amdgcn_ballot_w64(below_thresh) == __builtin_amdgcn_read_exec());
         if (__builtin_expect(all_below, 1)) {
             row_max = m_row;
         } else {
@@ -798,7 +768,7 @@ __device__ void pa_prefill_kernel_impl(pa_kargs kargs, int q_token_idx, int h_bl
         // Cluster 3:
         __builtin_amdgcn_s_setprio(1);
         compute_pv(v_p, v_v, v_o_slices, 0_I);
-        D_ACC row_max = max(m_row, attn_row_max<T>(v_s[1]));
+        row_max = max(m_row, attn_row_max<T>(v_s[1]));
         rescale_m = __builtin_amdgcn_exp2f(m_row - row_max);
         m_row = row_max;
         attn_sub_row<T>(v_s[1], row_max);
@@ -880,17 +850,9 @@ __device__ void pa_prefill_kernel_impl(pa_kargs kargs, int q_token_idx, int h_bl
         // Cluster 9:
         compute_pv(v_p, v_v, v_o_slices, 0_I);
 
-        // ──── Normalize O and store to gmem ────
-        D_ACC l_inv = (l_row > D_ACC(0.0f)) ? (D_ACC(1.0f) / l_row) : D_ACC(0.0f);
-        static_for<o_len>([&](auto i) { v_o[i.value] *= l_inv; });
-
         if (!stagger) {
             __builtin_amdgcn_s_barrier();
         }
-
-        auto u_o = make_layout_o<T>(warp_id, lane_id, kargs.stride_qo_h);
-        auto v_o_bf16 = cast<D_ATTN>(v_o);
-        store<T::VEC_O>(g_o, v_o_bf16, u_o);
     } else {
         // Cluster 0:
         s_waitcnt_vmcnt(number<T::v_buffer_load_insts>{});
@@ -931,7 +893,7 @@ __device__ void pa_prefill_kernel_impl(pa_kargs kargs, int q_token_idx, int h_bl
         // Cluster 3:
         __builtin_amdgcn_s_setprio(1);
         compute_pv(v_p, v_v, v_o_slices, 0_I);
-        D_ACC row_max = max(m_row, attn_row_max<T>(v_s[1]));
+        row_max = max(m_row, attn_row_max<T>(v_s[1]));
         rescale_m = __builtin_amdgcn_exp2f(m_row - row_max);
         m_row = row_max;
         attn_sub_row<T>(v_s[1], row_max);
@@ -1065,17 +1027,9 @@ __device__ void pa_prefill_kernel_impl(pa_kargs kargs, int q_token_idx, int h_bl
         // Cluster 13:
         compute_pv(v_p, v_v, v_o_slices, sv_slot_offset);
 
-        // ──── Normalize O and store to gmem ────
-        D_ACC l_inv = (l_row > D_ACC(0.0f)) ? (D_ACC(1.0f) / l_row) : D_ACC(0.0f);
-        static_for<o_len>([&](auto i) { v_o[i.value] *= l_inv; });
-
         if (!stagger) {
             __builtin_amdgcn_s_barrier();
         }
-
-        auto u_o = make_layout_o<T>(warp_id, lane_id, kargs.stride_qo_h);
-        auto v_o_bf16 = cast<D_ATTN>(v_o);
-        store<T::VEC_O>(g_o, v_o_bf16, u_o);
     }
 }
 
@@ -1085,22 +1039,88 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_kernel(pa_ka
     using namespace opus;
     using T = opus::remove_cvref_t<Traits>;
     using D_ATTN = typename T::D_ATTN;
+    using D_ACC = typename T::D_ACC;
 
     const int q_token_idx = block_id_x();
     const int h_block_idx = block_id_y();
-    const int page_idx_begin = kargs.kv_indptr[q_token_idx];
-    const int page_idx_end   = kargs.kv_indptr[q_token_idx + 1];
-    const int valid_kv_len   = page_idx_end - page_idx_begin;
-    const int num_kv_tiles   = ceil_div(valid_kv_len, T::KV_TILE_SIZE);
+
+    const int lane_id = thread_id_x() % T::WARP_SIZE;
+    const int warp_id = __builtin_amdgcn_readfirstlane(thread_id_x() / T::WARP_SIZE);
+
+    const int h_block_start = h_block_idx * T::NUM_WARPS * T::Q_TILE_SIZE;
+    const int qo_gmem_offset = q_token_idx * kargs.stride_qo_n + h_block_start * kargs.stride_qo_h;
 
     __shared__ char smem_k_buf[2 * T::smem_k_tile_elems * sizeof(D_ATTN)];
     __shared__ char smem_v_buf[2 * T::smem_v_tile_elems * sizeof(D_ATTN)];
 
-    if (num_kv_tiles <= 2) {
-        pa_prefill_le2_tiles_kernel_impl<Traits>(kargs, q_token_idx, h_block_idx, page_idx_begin, valid_kv_len, num_kv_tiles, smem_k_buf, smem_v_buf);
-    } else if (num_kv_tiles & 1) {
-        pa_prefill_kernel_impl<Traits, true>(kargs, q_token_idx, h_block_idx, page_idx_begin, valid_kv_len, num_kv_tiles, smem_k_buf, smem_v_buf);
-    } else {
-        pa_prefill_kernel_impl<Traits, false>(kargs, q_token_idx, h_block_idx, page_idx_begin, valid_kv_len, num_kv_tiles, smem_k_buf, smem_v_buf);
+    // Load Q once (shared across both segments)
+    auto g_q = make_gmem(reinterpret_cast<const D_ATTN*>(kargs.ptr_q) + qo_gmem_offset);
+    auto u_q = make_layout_q<T>(warp_id, lane_id, kargs.stride_qo_h);
+
+    vector_t<D_ATTN, T::Q_TILE_SIZE * T::D_TILE_SIZE / T::WARP_SIZE> v_q;
+    vector_t<D_ACC,  T::Q_TILE_SIZE * T::D_TILE_SIZE / T::WARP_SIZE> v_o;
+
+    constexpr index_t q_len = vector_traits<decltype(v_q)>::size();
+    constexpr index_t o_len = vector_traits<decltype(v_o)>::size();
+    constexpr float LOG2_E = 1.44269504089f;
+    const float temperature_scale = (1.0f / sqrtf(static_cast<float>(kargs.D))) * LOG2_E;
+
+    v_q = load<T::VEC_Q>(g_q, u_q);
+    auto v_q_f32 = cast<float>(v_q);
+    static_for<q_len>([&](auto i) { v_q_f32[i.value] *= temperature_scale; });
+    v_q = cast<D_ATTN>(v_q_f32);
+
+    // Initialize shared attention state
+    clear(v_o);
+    D_ACC m_row = opus::numeric_limits<D_ACC>::lowest();
+    D_ACC l_row = 0.0f;
+
+    // ──── Prefix segment ────
+    {
+        const int page_idx_begin = kargs.kv_indptr_prefix[q_token_idx];
+        const int page_idx_end   = kargs.kv_indptr_prefix[q_token_idx + 1];
+        const int valid_kv_len   = page_idx_end - page_idx_begin;
+        const int num_kv_tiles   = ceil_div(valid_kv_len, T::KV_TILE_SIZE);
+
+        if (num_kv_tiles <= 2) {
+            pa_prefill_accum_le2_tiles<Traits>(kargs, kargs.kv_indices_prefix, page_idx_begin, valid_kv_len, num_kv_tiles, smem_k_buf, smem_v_buf, v_q, v_o, m_row, l_row);
+        }
+        if (num_kv_tiles > 2 && num_kv_tiles & 1) {
+            pa_prefill_accum_pipelined<Traits, true>(kargs, kargs.kv_indices_prefix, page_idx_begin, valid_kv_len, num_kv_tiles, smem_k_buf, smem_v_buf, v_q, v_o, m_row, l_row);
+        }
+        if (num_kv_tiles > 2 && !(num_kv_tiles & 1)) {
+            pa_prefill_accum_pipelined<Traits, false>(kargs, kargs.kv_indices_prefix, page_idx_begin, valid_kv_len, num_kv_tiles, smem_k_buf, smem_v_buf, v_q, v_o, m_row, l_row);
+        }
     }
+
+    // ──── Extend segment ────
+    {
+        const int page_idx_begin = kargs.kv_indptr_extend[q_token_idx];
+        const int page_idx_end   = kargs.kv_indptr_extend[q_token_idx + 1];
+        const int valid_kv_len   = page_idx_end - page_idx_begin;
+        const int num_kv_tiles   = ceil_div(valid_kv_len, T::KV_TILE_SIZE);
+
+        if (num_kv_tiles <= 2) {
+            pa_prefill_accum_le2_tiles<Traits>(kargs, kargs.kv_indices_extend, page_idx_begin, valid_kv_len, num_kv_tiles, smem_k_buf, smem_v_buf, v_q, v_o, m_row, l_row);
+        }
+        if (num_kv_tiles > 2 && num_kv_tiles & 1) {
+            pa_prefill_accum_pipelined<Traits, true>(kargs, kargs.kv_indices_extend, page_idx_begin, valid_kv_len, num_kv_tiles, smem_k_buf, smem_v_buf, v_q, v_o, m_row, l_row);
+        }
+        if (num_kv_tiles > 2 && !(num_kv_tiles & 1)) {
+            pa_prefill_accum_pipelined<Traits, false>(kargs, kargs.kv_indices_extend, page_idx_begin, valid_kv_len, num_kv_tiles, smem_k_buf, smem_v_buf, v_q, v_o, m_row, l_row);
+        }
+    }
+
+    // ──── Normalize O and store to gmem ────
+    D_ACC l_inv = (l_row > D_ACC(0.0f)) ? (D_ACC(1.0f) / l_row) : D_ACC(0.0f);
+    static_for<o_len>([&](auto i) { v_o[i.value] *= l_inv; });
+
+    auto g_o = make_gmem(reinterpret_cast<D_ATTN*>(kargs.ptr_o) + qo_gmem_offset);
+    // Recompute lane/warp decomposition to prevent CSE with Q-load layout
+    int lane_id_o = thread_id_x() % T::WARP_SIZE;
+    asm volatile("" : "+v"(lane_id_o));
+    int warp_id_o = __builtin_amdgcn_readfirstlane(thread_id_x() / T::WARP_SIZE);
+    auto u_o = make_layout_o<T>(warp_id_o, lane_id_o, kargs.stride_qo_h);
+    auto v_o_bf16 = cast<D_ATTN>(v_o);
+    store<T::VEC_O>(g_o, v_o_bf16, u_o);
 }
