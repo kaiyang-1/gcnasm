@@ -1,7 +1,9 @@
 // Host-only: benchmark harness, CPU reference, main()
 #include <opus/hip_minimal.hpp>
+#include <algorithm>
 #include <random>
 #include <iostream>
+#include <limits>
 #include <numeric>
 #include <memory>
 #include <vector>
@@ -48,10 +50,89 @@ void rand_vector(T* ptr, size_t size, float min_val = 0.0f, float max_val = 1.0f
     }
 }
 
+void init_sparse_kv_indices(std::vector<int>& kv_indptr,
+                            std::vector<int>& kv_indices,
+                            int N,
+                            int total_pages,
+                            int kv_tile_size) {
+    assert(N >= 0);
+    assert(total_pages > 0);
+    assert(kv_tile_size > 0);
+
+    kv_indptr.assign(N + 1, 0);
+    kv_indices.clear();
+
+    std::mt19937 gen(1234);
+    std::vector<int> pages(total_pages);
+    std::iota(pages.begin(), pages.end(), 0);
+
+    auto clamp_len = [&](int len) {
+        return std::max(0, std::min(len, total_pages));
+    };
+
+    const std::vector<int> boundary_lengths = {
+        0,
+        1,
+        kv_tile_size - 1,
+        kv_tile_size,
+        kv_tile_size + 1,
+        2 * kv_tile_size,
+        2 * kv_tile_size + 1,
+        total_pages
+    };
+    std::uniform_int_distribution<int> random_len(0, total_pages);
+
+    for (int q = 0; q < N; ++q) {
+        int nnz = 0;
+        if (q < static_cast<int>(boundary_lengths.size())) {
+            nnz = clamp_len(boundary_lengths[q]);
+        } else {
+            nnz = random_len(gen);
+        }
+
+        std::shuffle(pages.begin(), pages.end(), gen);
+        kv_indices.insert(kv_indices.end(), pages.begin(), pages.begin() + nnz);
+        assert(kv_indices.size() <= static_cast<size_t>(std::numeric_limits<int>::max()));
+        kv_indptr[q + 1] = static_cast<int>(kv_indices.size());
+    }
+
+    assert(kv_indptr.front() == 0);
+    assert(kv_indptr.back() == static_cast<int>(kv_indices.size()));
+    for (int q = 0; q < N; ++q) {
+        assert(kv_indptr[q] <= kv_indptr[q + 1]);
+        for (int p = kv_indptr[q]; p < kv_indptr[q + 1]; ++p) {
+            assert(kv_indices[p] >= 0 && kv_indices[p] < total_pages);
+        }
+    }
+}
+
+void init_dense_kv_indices(std::vector<int>& kv_indptr,
+                           std::vector<int>& kv_indices,
+                           int N,
+                           int total_pages) {
+    assert(N >= 0);
+    assert(total_pages > 0);
+    const size_t total_indices = static_cast<size_t>(N) * total_pages;
+    assert(total_indices <= static_cast<size_t>(std::numeric_limits<int>::max()));
+
+    kv_indptr.resize(N + 1);
+    kv_indices.resize(total_indices);
+
+    for (int q = 0; q <= N; ++q) {
+        kv_indptr[q] = static_cast<int>(static_cast<size_t>(q) * total_pages);
+    }
+    for (int q = 0; q < N; ++q) {
+        const size_t row_begin = static_cast<size_t>(q) * total_pages;
+        for (int page = 0; page < total_pages; ++page) {
+            kv_indices[row_begin + page] = page;
+        }
+    }
+}
+
 // Benchmark PA kernel performance with warm-up and timing
 template<class Traits>
 void benchmark_pa_kernel(const pa_kargs& kargs, dim3 grid, dim3 block,
-                          int warmup = 100, int iterations = 50) {
+                          int indices_prefix_sum, int warmup = 100, int iterations = 50) {
     for (int i = 0; i < warmup; ++i) {
         pa_launch<Traits>(kargs, grid, block);
         CHECK_HIP_KERNEL_LAUNCH();
@@ -78,7 +159,7 @@ void benchmark_pa_kernel(const pa_kargs& kargs, dim3 grid, dim3 block,
 
     const float avg_time = total_time / iterations;
     //   sparse attention -> 4 * H * nnz(indices) * D
-    const double flops = (4.0 * kargs.H * kargs.indices_prefix_sum * kargs.D);
+    const double flops = (4.0 * kargs.H * indices_prefix_sum * kargs.D);
     const double tflops = flops / (avg_time * 1e-3) / 1e12;
 
     printf("PA Prefill Kernel Performance: avg_time=%.3f ms, %.2f TFlops\n",
@@ -210,6 +291,7 @@ int main(int argc, char** argv) {
 
     // Parse command line arguments. Supports: -n 16384 and -n=16384.
     bool verify = false;
+    bool dense_kv = false;
     auto parse_val = [](const char* arg, const char* flag) -> const char* {
         size_t len = std::strlen(flag);
         if (std::strncmp(arg, flag, len) == 0) {
@@ -222,6 +304,7 @@ int main(int argc, char** argv) {
         const char* arg = argv[i];
         const char* val;
         if (std::strcmp(arg, "--verify") == 0) { verify = true; continue; }
+        if (std::strcmp(arg, "--dense") == 0) { dense_kv = true; continue; }
         auto try_parse = [&](int& target, const char* flag) {
             if ((val = parse_val(arg, flag))) {
                 if (val == reinterpret_cast<const char*>(1)) { if (i + 1 < argc) target = std::atoi(argv[++i]); }
@@ -247,43 +330,47 @@ int main(int argc, char** argv) {
     // Allocate host memory
     const size_t q_size = (size_t)N * H * D;
     const size_t kv_size = (size_t)total_pages * D;
-    const int indices_prefix_sum = N * total_pages;
     auto host_q = std::make_unique<bf16_t[]>(q_size);
     auto host_k = std::make_unique<bf16_t[]>(kv_size);
     auto host_v = std::make_unique<bf16_t[]>(kv_size);
     auto host_o_ref = std::make_unique<bf16_t[]>(q_size);
     auto host_o_gpu = std::make_unique<bf16_t[]>(q_size);
-    std::vector<int> host_kv_indptr(N + 1);
-    std::vector<int> host_kv_indices(indices_prefix_sum);
+    std::vector<int> host_kv_indptr;
+    std::vector<int> host_kv_indices;
 
     // Initialize with random data
     rand_vector(host_q.get(), q_size, -2.f, 2.f);
     rand_vector(host_k.get(), kv_size, -2.f, 2.f);
     rand_vector(host_v.get(), kv_size, -2.f, 2.f);
-    for (int i = 0; i <= N; ++i) {
-        host_kv_indptr[i] = i * total_pages;
+    if (dense_kv) {
+        init_dense_kv_indices(host_kv_indptr, host_kv_indices, N, total_pages);
+    } else {
+        init_sparse_kv_indices(host_kv_indptr,
+                               host_kv_indices,
+                               N,
+                               total_pages,
+                               pa_traits<16, 32, 512, 8>::KV_TILE_SIZE);
     }
-    for (int i = 0; i < N; ++i) {
-        for (int page = 0; page < total_pages; ++page) {
-            host_kv_indices[i * total_pages + page] = page;
-        }
-    }
+    const int indices_prefix_sum = static_cast<int>(host_kv_indices.size());
 
     // Allocate device memory
     bf16_t *dev_q, *dev_k, *dev_v, *dev_o;
     int *dev_kv_indptr, *dev_kv_indices;
+    const size_t kv_indices_alloc_size = std::max<size_t>(host_kv_indices.size(), 1);
     CHECK_HIP(hipMalloc(&dev_q, q_size * sizeof(bf16_t)));
     CHECK_HIP(hipMalloc(&dev_k, kv_size * sizeof(bf16_t)));
     CHECK_HIP(hipMalloc(&dev_v, kv_size * sizeof(bf16_t)));
     CHECK_HIP(hipMalloc(&dev_o, q_size * sizeof(bf16_t)));
     CHECK_HIP(hipMalloc(&dev_kv_indptr, host_kv_indptr.size() * sizeof(int)));
-    CHECK_HIP(hipMalloc(&dev_kv_indices, host_kv_indices.size() * sizeof(int)));
+    CHECK_HIP(hipMalloc(&dev_kv_indices, kv_indices_alloc_size * sizeof(int)));
 
     CHECK_HIP(hipMemcpy(dev_q, host_q.get(), q_size * sizeof(bf16_t), hipMemcpyHostToDevice));
     CHECK_HIP(hipMemcpy(dev_k, host_k.get(), kv_size * sizeof(bf16_t), hipMemcpyHostToDevice));
     CHECK_HIP(hipMemcpy(dev_v, host_v.get(), kv_size * sizeof(bf16_t), hipMemcpyHostToDevice));
     CHECK_HIP(hipMemcpy(dev_kv_indptr, host_kv_indptr.data(), host_kv_indptr.size() * sizeof(int), hipMemcpyHostToDevice));
-    CHECK_HIP(hipMemcpy(dev_kv_indices, host_kv_indices.data(), host_kv_indices.size() * sizeof(int), hipMemcpyHostToDevice));
+    if (!host_kv_indices.empty()) {
+        CHECK_HIP(hipMemcpy(dev_kv_indices, host_kv_indices.data(), host_kv_indices.size() * sizeof(int), hipMemcpyHostToDevice));
+    }
 
     // Setup kernel arguments
     pa_kargs kargs{};
@@ -297,7 +384,6 @@ int main(int argc, char** argv) {
     kargs.H = H;
     kargs.D = D;
     kargs.total_pages = total_pages;
-    kargs.indices_prefix_sum = indices_prefix_sum;
     kargs.stride_qo_n = H * D;
     kargs.stride_qo_h = D;
     kargs.stride_kv_page = D;
@@ -337,7 +423,7 @@ int main(int argc, char** argv) {
         }
 
         printf("\n");
-        benchmark_pa_kernel<PATraits>(kargs, grid, block);
+        benchmark_pa_kernel<PATraits>(kargs, grid, block, indices_prefix_sum);
         printf("\n");
         return 0;
     };

@@ -15,7 +15,6 @@ struct pa_kargs {
     int H;
     int D;
     int total_pages;
-    int indices_prefix_sum;
     int stride_qo_n;
     int stride_qo_h;
     int stride_kv_page;

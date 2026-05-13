@@ -329,14 +329,8 @@ __device__ inline void attn_mask_oob_kv_tile(V& v_s, int valid_kv_len, int kv_ti
 }
 
 template<class Traits>
-__device__ void pa_prefill_le2_tiles_kernel_impl(pa_kargs kargs,
-                                             int q_token_idx,
-                                             int h_block_idx,
-                                             int page_idx_begin,
-                                             int valid_kv_len,
-                                             int num_kv_tiles,
-                                             char* smem_k_buf,
-                                             char* smem_v_buf) {
+__device__ void pa_prefill_le2_tiles_kernel_impl(pa_kargs kargs, int q_token_idx, int h_block_idx, int page_idx_begin, int valid_kv_len, int num_kv_tiles,
+                                                 char* smem_k_buf, char* smem_v_buf) {
     using namespace opus;
     using T = opus::remove_cvref_t<Traits>;
     using D_ATTN = typename T::D_ATTN;
@@ -485,14 +479,8 @@ __device__ void pa_prefill_le2_tiles_kernel_impl(pa_kargs kargs,
 }
 
 template<class Traits, bool OddTail>
-__device__ void pa_prefill_kernel_impl(pa_kargs kargs,
-                                       int q_token_idx,
-                                       int h_block_idx,
-                                       int page_idx_begin,
-                                       int valid_kv_len,
-                                       int num_kv_tiles,
-                                       char* smem_k_buf,
-                                       char* smem_v_buf) {
+__device__ void pa_prefill_kernel_impl(pa_kargs kargs, int q_token_idx, int h_block_idx, int page_idx_begin, int valid_kv_len, int num_kv_tiles,
+                                       char* smem_k_buf, char* smem_v_buf) {
     using namespace opus;
     using T = opus::remove_cvref_t<Traits>;
     using D_ATTN = typename T::D_ATTN;
