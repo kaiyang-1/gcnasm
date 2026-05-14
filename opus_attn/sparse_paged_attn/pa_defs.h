@@ -5,10 +5,11 @@ using bf16_t = __bf16;
 
 // Kernel arguments for PA prefill attention
 struct pa_kargs {
-    const void* __restrict__ ptr_q;  // [N, H, D]
-    const void* __restrict__ ptr_k;  // [total_pages, D]
-    const void* __restrict__ ptr_v;  // [total_pages, D]
-    void* __restrict__ ptr_o;        // [N, H, D]
+    const void* __restrict__ q_ptr;          // [N, H, D]
+    const void* __restrict__ unified_kv_ptr; // [total_pages, D], prefix source
+    const void* __restrict__ kv_ptr;         // [total_tokens, D], extend source
+    const void* __restrict__ attn_sink_ptr;  // [H], softmax denominator sink
+    void* __restrict__ out_ptr;              // [N, H, D]
     const int* __restrict__ kv_indptr_prefix;  // [N+1]
     const int* __restrict__ kv_indices_prefix; // [indices_prefix_sum_prefix]
     const int* __restrict__ kv_indptr_extend;  // [N+1]
@@ -17,9 +18,11 @@ struct pa_kargs {
     int H;
     int D;
     int total_pages;
+    int total_tokens;
     int stride_qo_n;
     int stride_qo_h;
     int stride_kv_page;
+    float softmax_scale;
 };
 
 // Configuration traits for PA kernel (tile sizes, data types, vector lengths, MFMA config).
@@ -81,16 +84,14 @@ struct pa_traits {
     static constexpr int smem_d_rpt = D_TILE_SIZE / D_128B_SIZE;
     static constexpr int smem_padding_32B = 32 / sizeof(D_ATTN);
 
-    static constexpr int smem_k_tile_elems = smem_n_rpt * smem_d_rpt * (smem_linear_wave + smem_padding_32B);
-    static constexpr int smem_v_tile_elems = smem_n_rpt * smem_d_rpt * (smem_linear_wave + smem_padding_32B);
+    static constexpr int smem_kv_tile_elems = smem_n_rpt * smem_d_rpt * (smem_linear_wave + smem_padding_32B);
 
-    static constexpr int k_buffer_load_insts = (KV_TILE_SIZE * D_TILE_SIZE) / (BLOCK_SIZE * VEC_KV);
-    static constexpr int v_buffer_load_insts = (KV_TILE_SIZE * D_TILE_SIZE) / (BLOCK_SIZE * VEC_KV);
+    static constexpr int kv_buffer_load_insts = (KV_TILE_SIZE * D_TILE_SIZE) / (BLOCK_SIZE * VEC_KV);
     static constexpr int k_ds_read_insts = (GEMM0_E_N * GEMM0_E_K * W_N * W_K) / (WARP_SIZE * VEC_KV);
     static constexpr int v_ds_read_insts = (GEMM1_E_N * GEMM1_E_K * W_N * W_K) / (WARP_SIZE * VEC_TR_V);
 
     static constexpr size_t smem_size_bytes() {
-        return 2 * (smem_k_tile_elems + smem_v_tile_elems) * sizeof(D_ATTN);
+        return 4 * smem_kv_tile_elems * sizeof(D_ATTN);
     }
 };
 
