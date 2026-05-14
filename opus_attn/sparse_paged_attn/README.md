@@ -2,16 +2,16 @@
 
 Optimized sparse paged prefill attention using the [OPUS](https://github.com/ROCm/aiter) C++ template library for DeepSeek-V4 inference on AMD gfx950.
 
-This directory targets the DeepSeek-V4 MQA prefill shape: `H_Q = 128` query heads, `D = 512` head dimension, and one shared K/V stream with layout `[total_pages, D]`. The production use case is model inference, where every prefill token attends to a sparse set of historical and current-chunk K/V rows.
+This directory targets the DeepSeek-V4 MQA prefill shape: `H_Q = 128` query heads and `D = 512` head dimension. The kernel consumes two sparse K/V sources: a unified prefix cache with layout `[total_pages, D]` and a current extend K/V tensor with layout `[total_tokens, D]`.
 
 ## Features
 
 - DeepSeek-V4 prefill attention shape: BF16 Q/K/V/O, `H_Q = 128`, `D = 512`.
-- MQA layout: Q/O carry the query-head dimension, while K/V are shared across query heads and have no head dimension.
+- MQA layout: Q/O carry the query-head dimension, while K/V rows are shared across query heads.
 - Paged sparse attention through two CSR index ranges per query token:
-  - `prefix`: rows from already materialized or persistent K/V state.
-  - `extend`: rows from the current prefill chunk.
-- Online softmax across both CSR ranges, with no materialized attention matrix.
+  - `prefix`: indices into `unified_kv_ptr` / `[total_pages, D]`.
+  - `extend`: indices into `kv_ptr` / `[total_tokens, D]`.
+- Online softmax across both CSR ranges, plus a per-head attention sink in the denominator, with no materialized attention matrix.
 - OPUS-based gfx950 kernel using BF16 MFMA, double-buffered K/V shared-memory tiles, and FP32 accumulation.
 - Standalone host harness with random sparse/dense index generation and CPU reference validation.
 
@@ -35,19 +35,21 @@ prefix_rows = kv_indices_prefix[kv_indptr_prefix[i] : kv_indptr_prefix[i + 1]]
 extend_rows = kv_indices_extend[kv_indptr_extend[i] : kv_indptr_extend[i + 1]]
 ```
 
-The kernel computes scaled dot-product attention over `prefix_rows` followed by `extend_rows`. Both ranges share the same online-softmax state, so the output is equivalent to attending over their concatenation:
+The kernel computes scaled dot-product attention over `prefix_rows` followed by `extend_rows`. Prefix rows index `UnifiedKV`; extend rows index the current `KV` tensor. Both ranges share the same online-softmax state:
 
 ```text
-rows_i = concat(prefix_rows, extend_rows)
-O[i, h, :] = softmax(Q[i, h, :] @ K[rows_i, :].T / sqrt(D)) @ V[rows_i, :]
+scores = concat(
+  Q[i, h, :] @ UnifiedKV[prefix_rows, :].T,
+  Q[i, h, :] @ KV[extend_rows, :].T
+) * softmax_scale
+P = exp(scores) / (sum(exp(scores)) + exp(attn_sink[h]))
+O[i, h, :] = P_prefix @ UnifiedKV[prefix_rows, :] + P_extend @ KV[extend_rows, :]
 ```
 
 In the DeepSeek-V4 prefill path, these two logical ranges map naturally to:
 
 - `prefix`: previously available state, such as the sliding-window tail and compressed cache pages.
 - `extend`: K/V rows produced by the current prefill chunk.
-
-The standalone C++ interface exposes one K pointer and one V pointer. Therefore, both CSR ranges index the same `[total_pages, D]` K/V address space. Integrations that keep prefix and extend in separate physical buffers should either pack them into one address space before launch or extend the kernel arguments with separate base pointers.
 
 ## Tensor Layout
 
@@ -56,13 +58,14 @@ All tensor data is BF16.
 | Tensor | Shape | Notes |
 | --- | --- | --- |
 | `Q` | `[N, H_Q, D]` | Query tokens. DeepSeek-V4 uses `H_Q = 128`. |
-| `K` | `[total_pages, D]` | Shared MQA K rows. |
-| `V` | `[total_pages, D]` | Shared MQA V rows. |
+| `UnifiedKV` | `[total_pages, D]` | Prefix K/V rows. |
+| `KV` | `[total_tokens, D]` | Current extend K/V rows. |
+| `AttnSink` | `[H_Q]` | Per-head sink score included in the softmax denominator only. |
 | `O` | `[N, H_Q, D]` | Output tokens. |
 | `kv_indptr_prefix` | `[N + 1]` | CSR row pointers for prefix rows. |
-| `kv_indices_prefix` | `[nnz_prefix]` | K/V row indices for prefix rows. |
+| `kv_indices_prefix` | `[nnz_prefix]` | Row indices into `UnifiedKV`. |
 | `kv_indptr_extend` | `[N + 1]` | CSR row pointers for extend rows. |
-| `kv_indices_extend` | `[nnz_extend]` | K/V row indices for extend rows. |
+| `kv_indices_extend` | `[nnz_extend]` | Row indices into `KV`. |
 
 The kernel assumes row-major contiguous layout with `D` as the fastest-changing dimension.
 
@@ -110,7 +113,7 @@ build/pa_prefill.exe
 Run with the DeepSeek-V4 MQA shape:
 
 ```bash
-./build/pa_prefill.exe -h_q 128 -d 512 -n 1024 -total_pages 1024 --verify
+./build/pa_prefill.exe -h_q 128 -d 512 -n 256 -total_pages 1024 -total_tokens 2048 --verify
 ```
 
 Useful options:
@@ -120,16 +123,17 @@ Useful options:
 | `-h_q` | `128` | Number of query heads. Currently only `128` is supported. |
 | `-d` | `512` | Head dimension. Only `512` is compiled in this directory. |
 | `-n` | `1024` | Number of query tokens in the standalone harness. |
-| `-total_pages` | `N` | Number of K/V rows available to the generated CSR indices. |
+| `-total_pages` | `N` | Number of prefix rows in `UnifiedKV`. |
+| `-total_tokens` | `N` | Number of extend rows in `KV`. |
 | `--dense` | off | Generate dense CSR rows instead of random sparse rows. |
 | `--verify` | off | Compare GPU output against the CPU reference implementation. |
 
-The harness initializes random BF16 tensors, generates prefix and extend CSR index ranges, launches the kernel, and optionally checks the result against `pa_attention_ref()` in `pa_host.cc`.
+The harness initializes random BF16 tensors and random per-head sink scores, generates prefix and extend CSR index ranges, launches the kernel, optionally checks the result against `pa_attention_ref()` in `pa_host.cc`, and then reports benchmark timing.
 
 ## Integration Notes
 
 - The caller owns CSR construction. Causal, sliding-window, compressed-cache, or top-k semantics should already be reflected in `kv_indices_*` and `kv_indptr_*`.
-- Empty CSR rows are allowed by the CPU reference. Production callers should avoid empty rows unless zero output is intended.
-- All K/V indices must be in `[0, total_pages)`.
-- The softmax scale is fixed to `1 / sqrt(D)` in both the GPU kernel and the CPU reference.
+- Empty CSR rows are allowed; with only the sink in the denominator, the output becomes zero.
+- Prefix indices must be in `[0, total_pages)`, and extend indices must be in `[0, total_tokens)`.
+- The standalone harness uses `softmax_scale = 1 / sqrt(D)`; integrations pass the scale through `pa_kargs`.
 - This directory intentionally contains only the D=512 prefill variant used by the DeepSeek-V4 MQA inference path.
