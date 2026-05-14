@@ -2,6 +2,7 @@
 #pragma once
 
 using bf16_t = __bf16;
+using fp16_t = __fp16;
 
 // Kernel arguments for PA prefill attention
 struct pa_kargs {
@@ -29,7 +30,8 @@ struct pa_kargs {
 template<int Q_TILE_SIZE_ = 16,
          int KV_TILE_SIZE_ = 32,
          int D_TILE_SIZE_ = 512,
-         int NUM_WARPS_ = 8>
+         int NUM_WARPS_ = 8,
+         typename D_ATTN_ = bf16_t>
 struct pa_traits {
     static constexpr int Q_TILE_SIZE = Q_TILE_SIZE_;
     static constexpr int KV_TILE_SIZE = KV_TILE_SIZE_;
@@ -39,8 +41,8 @@ struct pa_traits {
     static constexpr int WARP_SIZE = 64; // AMD wavefront size
     static constexpr int BLOCK_SIZE = NUM_WARPS * WARP_SIZE;
 
-    // Data types: Q/K/V/O share one bf16 type; accumulation fp32
-    using D_ATTN = bf16_t;
+    // Data types: Q/K/V/O share one attention dtype; accumulation fp32
+    using D_ATTN = D_ATTN_;
     using D_ACC  = float;
 
     // MFMA wave layout
@@ -49,7 +51,6 @@ struct pa_traits {
     static constexpr int T_K = 1;         // waves along K
 
     // MFMA base tile
-    //   D=512: bf16 16x16x32
     static constexpr int W_M = 16;
     static constexpr int W_N = 16;
     static constexpr int W_K = 32;
@@ -83,7 +84,6 @@ struct pa_traits {
     static constexpr int smem_n_rpt = KV_TILE_SIZE / smem_n_per_wave;
     static constexpr int smem_d_rpt = D_TILE_SIZE / D_128B_SIZE;
     static constexpr int smem_padding_32B = 32 / sizeof(D_ATTN);
-
     static constexpr int smem_kv_tile_elems = smem_n_rpt * smem_d_rpt * (smem_linear_wave + smem_padding_32B);
 
     static constexpr int kv_buffer_load_insts = (KV_TILE_SIZE * D_TILE_SIZE) / (BLOCK_SIZE * VEC_KV);

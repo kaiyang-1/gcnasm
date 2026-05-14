@@ -6,13 +6,13 @@ This directory targets the DeepSeek-V4 MQA prefill shape: `H_Q = 128` query head
 
 ## Features
 
-- DeepSeek-V4 prefill attention shape: BF16 Q/K/V/O, `H_Q = 128`, `D = 512`.
+- DeepSeek-V4 prefill attention shape: BF16 or FP16 Q/K/V/O, `H_Q = 128`, `D = 512`.
 - MQA layout: Q/O carry the query-head dimension, while K/V rows are shared across query heads.
 - Paged sparse attention through two CSR index ranges per query token:
   - `prefix`: indices into `unified_kv_ptr` / `[total_pages, D]`.
   - `extend`: indices into `kv_ptr` / `[total_tokens, D]`.
 - Online softmax across both CSR ranges, plus a per-head attention sink in the denominator, with no materialized attention matrix.
-- OPUS-based gfx950 kernel using BF16 MFMA, double-buffered K/V shared-memory tiles, and FP32 accumulation.
+- OPUS-based gfx950 kernel using BF16/FP16 MFMA, double-buffered K/V shared-memory tiles, and FP32 accumulation.
 - Standalone host harness with random sparse/dense index generation and CPU reference validation.
 
 ## Files
@@ -22,7 +22,8 @@ sparse_paged_attn/
 |-- Makefile                         # Build rules for the standalone executable
 |-- pa_defs.h                        # Kernel argument struct and compile-time traits
 |-- pa_host.cc                       # Host launcher, test harness, and CPU reference
-|-- pa_prefill_kernel.cc             # D=512 kernel instantiation
+|-- pa_prefill_bf16_kernel.cc        # D=512 BF16 kernel instantiation
+|-- pa_prefill_fp16_kernel.cc        # D=512 FP16 kernel instantiation
 `-- pa_prefill_kernel_template.hpp   # OPUS/HIP kernel implementation
 ```
 
@@ -53,7 +54,7 @@ In the DeepSeek-V4 prefill path, these two logical ranges map naturally to:
 
 ## Tensor Layout
 
-All tensor data is BF16.
+Q/K/V/O tensor data is selected with `-dtype bf16|fp16`. `AttnSink` and accumulation stay FP32.
 
 | Tensor | Shape | Notes |
 | --- | --- | --- |
@@ -71,10 +72,11 @@ The kernel assumes row-major contiguous layout with `D` as the fastest-changing 
 
 ## Kernel Configuration
 
-The compiled instantiation is:
+The compiled instantiations are:
 
 ```cpp
-pa_traits<16, 32, 512, 8>
+pa_traits<16, 32, 512, 8, bf16_t>
+pa_traits<16, 32, 512, 8, fp16_t>
 ```
 
 | Parameter | Value | Meaning |
@@ -113,7 +115,7 @@ build/pa_prefill.exe
 Run with the DeepSeek-V4 MQA shape:
 
 ```bash
-./build/pa_prefill.exe -h_q 128 -d 512 -n 256 -total_pages 1024 -total_tokens 2048 --verify
+./build/pa_prefill.exe -dtype bf16 -h_q 128 -d 512 -n 256 -total_pages 1024 -total_tokens 2048 --verify
 ```
 
 Useful options:
@@ -125,10 +127,11 @@ Useful options:
 | `-n` | `1024` | Number of query tokens in the standalone harness. |
 | `-total_pages` | `N` | Number of prefix rows in `UnifiedKV`. |
 | `-total_tokens` | `N` | Number of extend rows in `KV`. |
+| `-dtype` | `bf16` | Attention tensor dtype: `bf16` or `fp16`. |
 | `--dense` | off | Generate dense CSR rows instead of random sparse rows. |
 | `--verify` | off | Compare GPU output against the CPU reference implementation. |
 
-The harness initializes random BF16 tensors and random per-head sink scores, generates prefix and extend CSR index ranges, launches the kernel, optionally checks the result against `pa_attention_ref()` in `pa_host.cc`, and then reports benchmark timing.
+The harness initializes random attention tensors in the selected dtype and random per-head sink scores, generates prefix and extend CSR index ranges, launches the kernel, optionally checks the result against `pa_attention_ref()` in `pa_host.cc`, and then reports benchmark timing.
 
 ## Integration Notes
 

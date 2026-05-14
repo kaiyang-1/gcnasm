@@ -7,7 +7,7 @@ COMMON_FLAGS = -I. -I$(OPUS_INCLUDE_DIR) -std=c++20 -fopenmp -O3 -Wall --offload
 BUILD = build
 OUT   = $(BUILD)/pa_prefill.exe
 
-KERNEL_SRCS = pa_prefill_kernel.cc
+KERNEL_SRCS = pa_prefill_bf16_kernel.cc pa_prefill_fp16_kernel.cc
 HOST_SRC    = pa_host.cc
 KERNEL_OBJS = $(patsubst %.cc,$(BUILD)/%.o,$(KERNEL_SRCS))
 HOST_OBJ    = $(BUILD)/pa_host.o
@@ -34,7 +34,8 @@ $(OUT): $(KERNEL_OBJS) $(HOST_OBJ)
 	$(HIPCC) $^ --offload-arch=$(ARCH) -fopenmp -o $@
 
 benchmark: $(OUT)
-	@echo "=== d=512 ===" && $(OUT) -d 512
+	@echo "=== d=512 bf16 ===" && $(OUT) -dtype bf16 -d 512
+	@echo "=== d=512 fp16 ===" && $(OUT) -dtype fp16 -d 512
 
 clean:
 	rm -rf $(BUILD)

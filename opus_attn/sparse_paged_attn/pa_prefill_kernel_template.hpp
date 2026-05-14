@@ -1111,6 +1111,6 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_kernel(pa_ka
     asm volatile("" : "+v"(lane_id_o));
     int warp_id_o = __builtin_amdgcn_readfirstlane(thread_id_x() / T::WARP_SIZE);
     auto u_o = make_layout_o<T>(warp_id_o, lane_id_o, kargs.stride_qo_h);
-    auto v_o_bf16 = cast<D_ATTN>(v_o);
-    store<T::VEC_O>(g_o, v_o_bf16, u_o);
+    auto v_o_attn = cast<D_ATTN>(v_o);
+    store<T::VEC_O>(g_o, v_o_attn, u_o);
 }

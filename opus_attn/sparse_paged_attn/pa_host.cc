@@ -11,11 +11,12 @@
 #include <cstdlib>
 #include <cmath>
 #include <cassert>
+#include <string>
 #include <omp.h>
 
 #include "pa_defs.h"
 
-// Declared in pa_prefill_kernel.cc (device TUs)
+// Declared in per-dtype kernel instantiation TUs.
 template<class Traits>
 __global__ void pa_prefill_kernel(pa_kargs kargs);
 
@@ -169,7 +170,8 @@ void benchmark_pa_kernel(const pa_kargs& kargs, dim3 grid, dim3 block,
 }
 
 // Validate PA GPU results against CPU reference
-bool validate_pa_results(const bf16_t* ref, const bf16_t* gpu,
+template<typename DType>
+bool validate_pa_results(const DType* ref, const DType* gpu,
                           int N, int H, int D, float threshold = 5e-2f) {
     bool all_valid = true;
     size_t total_errors = 0;
@@ -209,12 +211,13 @@ bool validate_pa_results(const bf16_t* ref, const bf16_t* gpu,
 //   extend rows index KV[total_tokens, D]
 //   O[i,h,:] = softmax(Q[i,h,:] @ concat(prefix, extend)^T * softmax_scale) @ concat(prefix, extend)
 //
+template<typename DType>
 void pa_attention_ref(
-    const bf16_t* Q,          // [N, H, D]
-    const bf16_t* UnifiedKV,  // [total_pages, D]
-    const bf16_t* KV,         // [total_tokens, D]
+    const DType* Q,           // [N, H, D]
+    const DType* UnifiedKV,   // [total_pages, D]
+    const DType* KV,          // [total_tokens, D]
     const float*  AttnSink,   // [H]
-    bf16_t*       O,          // [N, H, D]
+    DType*        O,          // [N, H, D]
     const int* kv_indptr_prefix,
     const int* kv_indices_prefix,
     const int* kv_indptr_extend,
@@ -231,7 +234,7 @@ void pa_attention_ref(
     #pragma omp parallel for collapse(2)
     for (int h = 0; h < H; h++) {
         for (int i = 0; i < N; i++) {
-            const bf16_t* q_row = Q + i * stride_qo_n + h * stride_qo_h;
+            const DType* q_row = Q + i * stride_qo_n + h * stride_qo_h;
             const int prefix_begin = kv_indptr_prefix[i];
             const int prefix_end = kv_indptr_prefix[i + 1];
             const int extend_begin = kv_indptr_extend[i];
@@ -241,9 +244,9 @@ void pa_attention_ref(
             const int num_rows = num_prefix + num_extend;
 
             if (num_rows <= 0) {
-                bf16_t* o_row = O + i * stride_qo_n + h * stride_qo_h;
+                DType* o_row = O + i * stride_qo_n + h * stride_qo_h;
                 for (int d = 0; d < D; d++) {
-                    o_row[d] = static_cast<bf16_t>(0.0f);
+                    o_row[d] = static_cast<DType>(0.0f);
                 }
                 continue;
             }
@@ -252,19 +255,19 @@ void pa_attention_ref(
             std::vector<float> scores(num_rows);
             for (int p = 0; p < num_prefix; p++) {
                 const int kv_row = kv_indices_prefix[prefix_begin + p];
-                const bf16_t* k_row = UnifiedKV + kv_row * stride_kv_page;
+                const DType* k_row = UnifiedKV + kv_row * stride_kv_page;
                 float dot = 0.0f;
                 for (int d = 0; d < D; d++) {
-                    dot += static_cast<float>(q_row[d] * k_row[d]);
+                    dot += static_cast<float>(q_row[d]) * static_cast<float>(k_row[d]);
                 }
                 scores[p] = dot * softmax_scale;
             }
             for (int p = 0; p < num_extend; p++) {
                 const int kv_row = kv_indices_extend[extend_begin + p];
-                const bf16_t* k_row = KV + kv_row * stride_kv_page;
+                const DType* k_row = KV + kv_row * stride_kv_page;
                 float dot = 0.0f;
                 for (int d = 0; d < D; d++) {
-                    dot += static_cast<float>(q_row[d] * k_row[d]);
+                    dot += static_cast<float>(q_row[d]) * static_cast<float>(k_row[d]);
                 }
                 scores[num_prefix + p] = dot * softmax_scale;
             }
@@ -280,26 +283,26 @@ void pa_attention_ref(
             for (int p = 0; p < num_rows; p++) {
                 scores[p] /= sum_exp;
             }
-            std::vector<bf16_t> p_row(num_rows);
+            std::vector<DType> p_row(num_rows);
             for (int p = 0; p < num_rows; p++) {
-                p_row[p] = static_cast<bf16_t>(scores[p]);
+                p_row[p] = static_cast<DType>(scores[p]);
             }
 
             // ---- Output: O[i,h,d] = sum_p P[p] * KV[kv_indices[p],d] ----
-            bf16_t* o_row = O + i * stride_qo_n + h * stride_qo_h;
+            DType* o_row = O + i * stride_qo_n + h * stride_qo_h;
             for (int d = 0; d < D; d++) {
                 float acc = 0.0f;
                 for (int p = 0; p < num_prefix; p++) {
                     const int kv_row = kv_indices_prefix[prefix_begin + p];
-                    const bf16_t* v_row = UnifiedKV + kv_row * stride_kv_page;
-                    acc += static_cast<float>(p_row[p] * v_row[d]);
+                    const DType* v_row = UnifiedKV + kv_row * stride_kv_page;
+                    acc += static_cast<float>(p_row[p]) * static_cast<float>(v_row[d]);
                 }
                 for (int p = 0; p < num_extend; p++) {
                     const int kv_row = kv_indices_extend[extend_begin + p];
-                    const bf16_t* v_row = KV + kv_row * stride_kv_page;
-                    acc += static_cast<float>(p_row[num_prefix + p] * v_row[d]);
+                    const DType* v_row = KV + kv_row * stride_kv_page;
+                    acc += static_cast<float>(p_row[num_prefix + p]) * static_cast<float>(v_row[d]);
                 }
-                o_row[d] = static_cast<bf16_t>(acc);
+                o_row[d] = static_cast<DType>(acc);
             }
         }
     }
@@ -307,67 +310,35 @@ void pa_attention_ref(
 
 // ─── main ───────────────────────────────────────────────────────────────────
 
-int main(int argc, char** argv) {
-    int H = 128;   // query heads
-    int N = 1024;  // sequence length
-    int D = 512;   // head dimension
-    int total_pages = -1; // rows in unified_kv; default N after parsing
-    int total_tokens = -1; // rows in the per-fwd extend KV tensor; default N
+template<class PATraits>
+int run_pa_case(int H, int N, int D, int total_pages, int total_tokens,
+                bool verify, bool dense_kv, const char* dtype_name) {
+    using DType = typename PATraits::D_ATTN;
 
-    // Parse command line arguments. Supports: -n 16384 and -n=16384.
-    bool verify = false;
-    bool dense_kv = false;
-    auto parse_val = [](const char* arg, const char* flag) -> const char* {
-        size_t len = std::strlen(flag);
-        if (std::strncmp(arg, flag, len) == 0) {
-            if (arg[len] == '=') return arg + len + 1;       // -flag=value
-            if (arg[len] == '\0') return reinterpret_cast<const char*>(1); // -flag value (next arg)
-        }
-        return nullptr;
-    };
-    for (int i = 1; i < argc; ++i) {
-        const char* arg = argv[i];
-        const char* val;
-        if (std::strcmp(arg, "--verify") == 0) { verify = true; continue; }
-        if (std::strcmp(arg, "--dense") == 0) { dense_kv = true; continue; }
-        auto try_parse = [&](int& target, const char* flag) {
-            if ((val = parse_val(arg, flag))) {
-                if (val == reinterpret_cast<const char*>(1)) { if (i + 1 < argc) target = std::atoi(argv[++i]); }
-                else target = std::atoi(val);
-                return true;
-            }
-            return false;
-        };
-        if (try_parse(H, "-h_q")) continue;
-        if (try_parse(N, "-n")) continue;
-        if (try_parse(D, "-d")) continue;
-        if (try_parse(total_pages, "-total_pages")) continue;
-        if (try_parse(total_tokens, "-total_tokens")) continue;
-    }
-    if (total_pages < 0) {
-        total_pages = N;
-    }
-    if (total_tokens < 0) {
-        total_tokens = N;
-    }
-
-    if (H <= 0 || N <= 0 || D <= 0 || total_pages <= 0 || total_tokens <= 0) {
-        std::cerr << "Invalid parameters. H_Q,N,D,total_pages,total_tokens must be positive.\n";
+    if (D != PATraits::D_TILE_SIZE) {
+        std::cerr << "This kernel only supports head dimension D=" << PATraits::D_TILE_SIZE << ", got D=" << D << "\n";
         return 1;
     }
-    printf("PA Prefill Attention: H_Q=%d, N=%d, D=%d, total_pages=%d, total_tokens=%d\n",
-           H, N, D, total_pages, total_tokens);
+    if ((H % (PATraits::Q_TILE_SIZE * PATraits::NUM_WARPS)) != 0) {
+        std::cerr << "This kernel requires H to be a multiple of "
+                  << (PATraits::Q_TILE_SIZE * PATraits::NUM_WARPS)
+                  << " so every warp maps to a valid H tile, got H=" << H << "\n";
+        return 1;
+    }
+
+    printf("PA Prefill Attention: dtype=%s, H_Q=%d, N=%d, D=%d, total_pages=%d, total_tokens=%d\n",
+           dtype_name, H, N, D, total_pages, total_tokens);
 
     // Allocate host memory
     const size_t q_size = (size_t)N * H * D;
     const size_t unified_kv_size = (size_t)total_pages * D;
     const size_t kv_size = (size_t)total_tokens * D;
-    auto host_q = std::make_unique<bf16_t[]>(q_size);
-    auto host_unified_kv = std::make_unique<bf16_t[]>(unified_kv_size);
-    auto host_kv = std::make_unique<bf16_t[]>(kv_size);
+    auto host_q = std::make_unique<DType[]>(q_size);
+    auto host_unified_kv = std::make_unique<DType[]>(unified_kv_size);
+    auto host_kv = std::make_unique<DType[]>(kv_size);
     auto host_attn_sink = std::make_unique<float[]>(H);
-    auto host_o_ref = std::make_unique<bf16_t[]>(q_size);
-    auto host_o_gpu = std::make_unique<bf16_t[]>(q_size);
+    auto host_o_ref = std::make_unique<DType[]>(q_size);
+    auto host_o_gpu = std::make_unique<DType[]>(q_size);
     std::vector<int> host_kv_indptr_prefix;
     std::vector<int> host_kv_indices_prefix;
     std::vector<int> host_kv_indptr_extend;
@@ -386,13 +357,13 @@ int main(int argc, char** argv) {
                                host_kv_indices_prefix,
                                N,
                                total_pages,
-                               pa_traits<16, 32, 512, 8>::KV_TILE_SIZE,
+                               PATraits::KV_TILE_SIZE,
                                1234);
         init_sparse_kv_indices(host_kv_indptr_extend,
                                host_kv_indices_extend,
                                N,
                                total_tokens,
-                               pa_traits<16, 32, 512, 8>::KV_TILE_SIZE,
+                               PATraits::KV_TILE_SIZE,
                                5678);
     }
     const size_t total_kv_indices = host_kv_indices_prefix.size() + host_kv_indices_extend.size();
@@ -400,24 +371,24 @@ int main(int argc, char** argv) {
     const int indices_prefix_sum = static_cast<int>(total_kv_indices);
 
     // Allocate device memory
-    bf16_t *dev_q, *dev_unified_kv, *dev_kv, *dev_o;
+    DType *dev_q, *dev_unified_kv, *dev_kv, *dev_o;
     float *dev_attn_sink;
     int *dev_kv_indptr_prefix, *dev_kv_indices_prefix, *dev_kv_indptr_extend, *dev_kv_indices_extend;
     const size_t kv_indices_prefix_alloc_size = std::max<size_t>(host_kv_indices_prefix.size(), 1);
     const size_t kv_indices_extend_alloc_size = std::max<size_t>(host_kv_indices_extend.size(), 1);
-    CHECK_HIP(hipMalloc(&dev_q, q_size * sizeof(bf16_t)));
-    CHECK_HIP(hipMalloc(&dev_unified_kv, unified_kv_size * sizeof(bf16_t)));
-    CHECK_HIP(hipMalloc(&dev_kv, kv_size * sizeof(bf16_t)));
+    CHECK_HIP(hipMalloc(&dev_q, q_size * sizeof(DType)));
+    CHECK_HIP(hipMalloc(&dev_unified_kv, unified_kv_size * sizeof(DType)));
+    CHECK_HIP(hipMalloc(&dev_kv, kv_size * sizeof(DType)));
     CHECK_HIP(hipMalloc(&dev_attn_sink, H * sizeof(float)));
-    CHECK_HIP(hipMalloc(&dev_o, q_size * sizeof(bf16_t)));
+    CHECK_HIP(hipMalloc(&dev_o, q_size * sizeof(DType)));
     CHECK_HIP(hipMalloc(&dev_kv_indptr_prefix, host_kv_indptr_prefix.size() * sizeof(int)));
     CHECK_HIP(hipMalloc(&dev_kv_indices_prefix, kv_indices_prefix_alloc_size * sizeof(int)));
     CHECK_HIP(hipMalloc(&dev_kv_indptr_extend, host_kv_indptr_extend.size() * sizeof(int)));
     CHECK_HIP(hipMalloc(&dev_kv_indices_extend, kv_indices_extend_alloc_size * sizeof(int)));
 
-    CHECK_HIP(hipMemcpy(dev_q, host_q.get(), q_size * sizeof(bf16_t), hipMemcpyHostToDevice));
-    CHECK_HIP(hipMemcpy(dev_unified_kv, host_unified_kv.get(), unified_kv_size * sizeof(bf16_t), hipMemcpyHostToDevice));
-    CHECK_HIP(hipMemcpy(dev_kv, host_kv.get(), kv_size * sizeof(bf16_t), hipMemcpyHostToDevice));
+    CHECK_HIP(hipMemcpy(dev_q, host_q.get(), q_size * sizeof(DType), hipMemcpyHostToDevice));
+    CHECK_HIP(hipMemcpy(dev_unified_kv, host_unified_kv.get(), unified_kv_size * sizeof(DType), hipMemcpyHostToDevice));
+    CHECK_HIP(hipMemcpy(dev_kv, host_kv.get(), kv_size * sizeof(DType), hipMemcpyHostToDevice));
     CHECK_HIP(hipMemcpy(dev_attn_sink, host_attn_sink.get(), H * sizeof(float), hipMemcpyHostToDevice));
     CHECK_HIP(hipMemcpy(dev_kv_indptr_prefix, host_kv_indptr_prefix.data(), host_kv_indptr_prefix.size() * sizeof(int), hipMemcpyHostToDevice));
     CHECK_HIP(hipMemcpy(dev_kv_indptr_extend, host_kv_indptr_extend.data(), host_kv_indptr_extend.size() * sizeof(int), hipMemcpyHostToDevice));
@@ -449,56 +420,36 @@ int main(int argc, char** argv) {
     kargs.stride_kv_page = D;
     kargs.softmax_scale = 1.0f / std::sqrt(static_cast<float>(D));
 
-    // Dispatch to kernel
-    auto run = [&]<typename PATraits>(PATraits) {
-        if (D != PATraits::D_TILE_SIZE) {
-            std::cerr << "This kernel only supports head dimension D=" << PATraits::D_TILE_SIZE << ", got D=" << D << "\n";
-            return 1;
-        }
-        if ((H % (PATraits::Q_TILE_SIZE * PATraits::NUM_WARPS)) != 0) {
-            std::cerr << "This kernel requires H to be a multiple of "
-                      << (PATraits::Q_TILE_SIZE * PATraits::NUM_WARPS)
-                      << " so every warp maps to a valid H tile, got H=" << H << "\n";
-            return 1;
-        }
-        const int num_h_tiles = ceil_div(H, PATraits::Q_TILE_SIZE);
-        const int num_h_blocks = ceil_div(num_h_tiles, PATraits::NUM_WARPS);
-        dim3 grid(N, num_h_blocks, 1);
-        dim3 block(PATraits::BLOCK_SIZE);
+    const int num_h_tiles = ceil_div(H, PATraits::Q_TILE_SIZE);
+    const int num_h_blocks = ceil_div(num_h_tiles, PATraits::NUM_WARPS);
+    dim3 grid(N, num_h_blocks, 1);
+    dim3 block(PATraits::BLOCK_SIZE);
 
-        printf("PA kernel launch config: grid=(%d,%d,%d), block=%d (NUM_WARPS=%d), smem=%zu bytes (K/V tiles)\n",
-               grid.x, grid.y, grid.z, (int)block.x, PATraits::NUM_WARPS, PATraits::smem_size_bytes());
+    printf("PA kernel launch config: grid=(%d,%d,%d), block=%d (NUM_WARPS=%d), smem=%zu bytes (K/V tiles)\n",
+           grid.x, grid.y, grid.z, (int)block.x, PATraits::NUM_WARPS, PATraits::smem_size_bytes());
 
-        pa_launch<PATraits>(kargs, grid, block);
-        CHECK_HIP_KERNEL_LAUNCH();
+    pa_launch<PATraits>(kargs, grid, block);
+    CHECK_HIP_KERNEL_LAUNCH();
 
-        if (verify) {
-            printf("\nValidating GPU results against CPU reference...\n");
-            CHECK_HIP(hipMemcpy(host_o_gpu.get(), dev_o, q_size * sizeof(bf16_t), hipMemcpyDeviceToHost));
-            pa_attention_ref(host_q.get(), host_unified_kv.get(), host_kv.get(), host_attn_sink.get(), host_o_ref.get(),
-                              host_kv_indptr_prefix.data(), host_kv_indices_prefix.data(),
-                              host_kv_indptr_extend.data(), host_kv_indices_extend.data(),
-                              N, H, D);
+    int rc = 0;
+    if (verify) {
+        printf("\nValidating GPU results against CPU reference...\n");
+        CHECK_HIP(hipMemcpy(host_o_gpu.get(), dev_o, q_size * sizeof(DType), hipMemcpyDeviceToHost));
+        pa_attention_ref<DType>(host_q.get(), host_unified_kv.get(), host_kv.get(), host_attn_sink.get(), host_o_ref.get(),
+                                host_kv_indptr_prefix.data(), host_kv_indices_prefix.data(),
+                                host_kv_indptr_extend.data(), host_kv_indices_extend.data(),
+                                N, H, D);
 
-            bool all_valid = validate_pa_results(host_o_ref.get(), host_o_gpu.get(), N, H, D);
-            printf("\n[Overall] %s\n", all_valid ? "✓ GPU KERNEL VALID" : "✗ GPU KERNEL FAILED");
-            if (!all_valid) return 1;
-        }
+        bool all_valid = validate_pa_results<DType>(host_o_ref.get(), host_o_gpu.get(), N, H, D);
+        printf("\n[Overall] %s\n", all_valid ? "✓ GPU KERNEL VALID" : "✗ GPU KERNEL FAILED");
+        if (!all_valid) rc = 1;
+    }
 
+    if (!rc) {
         printf("\n");
         benchmark_pa_kernel<PATraits>(kargs, grid, block, indices_prefix_sum);
         printf("\n");
-        return 0;
-    };
-
-    int rc;
-    if (D == 512) {
-        rc = run(pa_traits<16, 32, 512, 8>{});
-    } else {
-        std::cerr << "-d must be 512, got " << D << "\n";
-        return 1;
     }
-    if (rc) return rc;
 
     // Cleanup
     CHECK_HIP(hipFree(dev_q));
@@ -511,5 +462,78 @@ int main(int argc, char** argv) {
     CHECK_HIP(hipFree(dev_kv_indptr_extend));
     CHECK_HIP(hipFree(dev_kv_indices_extend));
 
-    return 0;
+    return rc;
+}
+
+int main(int argc, char** argv) {
+    int H = 128;   // query heads
+    int N = 1024;  // sequence length
+    int D = 512;   // head dimension
+    int total_pages = -1; // rows in unified_kv; default N after parsing
+    int total_tokens = -1; // rows in the per-fwd extend KV tensor; default N
+    std::string dtype = "bf16";
+
+    // Parse command line arguments. Supports: -n 16384 and -n=16384.
+    bool verify = false;
+    bool dense_kv = false;
+    auto parse_val = [](const char* arg, const char* flag) -> const char* {
+        size_t len = std::strlen(flag);
+        if (std::strncmp(arg, flag, len) == 0) {
+            if (arg[len] == '=') return arg + len + 1;       // -flag=value
+            if (arg[len] == '\0') return reinterpret_cast<const char*>(1); // -flag value (next arg)
+        }
+        return nullptr;
+    };
+    for (int i = 1; i < argc; ++i) {
+        const char* arg = argv[i];
+        const char* val;
+        if (std::strcmp(arg, "--verify") == 0) { verify = true; continue; }
+        if (std::strcmp(arg, "--dense") == 0) { dense_kv = true; continue; }
+        auto try_parse = [&](int& target, const char* flag) {
+            if ((val = parse_val(arg, flag))) {
+                if (val == reinterpret_cast<const char*>(1)) { if (i + 1 < argc) target = std::atoi(argv[++i]); }
+                else target = std::atoi(val);
+                return true;
+            }
+            return false;
+        };
+        auto try_parse_string = [&](std::string& target, const char* flag) {
+            if ((val = parse_val(arg, flag))) {
+                if (val == reinterpret_cast<const char*>(1)) { if (i + 1 < argc) target = argv[++i]; }
+                else target = val;
+                return true;
+            }
+            return false;
+        };
+        if (try_parse(H, "-h_q")) continue;
+        if (try_parse(N, "-n")) continue;
+        if (try_parse(D, "-d")) continue;
+        if (try_parse(total_pages, "-total_pages")) continue;
+        if (try_parse(total_tokens, "-total_tokens")) continue;
+        if (try_parse_string(dtype, "-dtype")) continue;
+    }
+    if (total_pages < 0) {
+        total_pages = N;
+    }
+    if (total_tokens < 0) {
+        total_tokens = N;
+    }
+
+    if (H <= 0 || N <= 0 || D <= 0 || total_pages <= 0 || total_tokens <= 0) {
+        std::cerr << "Invalid parameters. H_Q,N,D,total_pages,total_tokens must be positive.\n";
+        return 1;
+    }
+    if (D != 512) {
+        std::cerr << "-d must be 512, got " << D << "\n";
+        return 1;
+    }
+    if (dtype == "bf16") {
+        return run_pa_case<pa_traits<16, 32, 512, 8, bf16_t>>(H, N, D, total_pages, total_tokens, verify, dense_kv, "bf16");
+    }
+    if (dtype == "fp16") {
+        return run_pa_case<pa_traits<16, 32, 512, 8, fp16_t>>(H, N, D, total_pages, total_tokens, verify, dense_kv, "fp16");
+    }
+
+    std::cerr << "-dtype must be bf16 or fp16, got " << dtype << "\n";
+    return 1;
 }
