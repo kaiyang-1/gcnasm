@@ -1097,8 +1097,8 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_kernel(pa_ka
 
     // ──── Sink finalization, normalize O, and store to gmem ────
     const int sink_head_idx = h_block_start + warp_id * T::Q_TILE_SIZE + (lane_id % T::W_M);
-    auto attn_sink = reinterpret_cast<const D_ACC*>(kargs.attn_sink_ptr);
-    D_ACC sink_log2 = attn_sink[sink_head_idx] * LOG2_E;
+    auto g_attn_sink = make_gmem(reinterpret_cast<const D_ACC*>(kargs.attn_sink_ptr), kargs.H * sizeof(D_ACC));
+    D_ACC sink_log2 = load(g_attn_sink, sink_head_idx)[0] * LOG2_E;
     D_ACC m_final = max(m_row, sink_log2);
     D_ACC alpha = __builtin_amdgcn_exp2f(m_row - m_final);
     D_ACC l_final = l_row * alpha + __builtin_amdgcn_exp2f(sink_log2 - m_final);
