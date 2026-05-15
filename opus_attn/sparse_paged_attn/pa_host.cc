@@ -319,12 +319,6 @@ int run_pa_case(int H, int N, int D, int total_pages, int total_tokens,
         std::cerr << "This kernel only supports head dimension D=" << PATraits::D_TILE_SIZE << ", got D=" << D << "\n";
         return 1;
     }
-    if ((H % (PATraits::Q_TILE_SIZE * PATraits::NUM_WARPS)) != 0) {
-        std::cerr << "This kernel requires H to be a multiple of "
-                  << (PATraits::Q_TILE_SIZE * PATraits::NUM_WARPS)
-                  << " so every warp maps to a valid H tile, got H=" << H << "\n";
-        return 1;
-    }
 
     printf("PA Prefill Attention: dtype=%s, H_Q=%d, N=%d, D=%d, total_pages=%d, total_tokens=%d\n",
            dtype_name, H, N, D, total_pages, total_tokens);

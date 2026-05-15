@@ -1039,7 +1039,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_kernel(pa_ka
     __shared__ char smem_kv_buf[T::smem_size_bytes()];
 
     // Load Q once (shared across both segments)
-    auto g_q = make_gmem(reinterpret_cast<const D_ATTN*>(kargs.q_ptr) + qo_gmem_offset);
+    auto g_q = make_gmem(reinterpret_cast<const D_ATTN*>(kargs.q_ptr) + qo_gmem_offset, (kargs.H - h_block_start) * kargs.stride_qo_h * sizeof(D_ATTN));
     auto u_q = make_layout_q<T>(warp_id, lane_id, kargs.stride_qo_h);
 
     vector_t<D_ATTN, T::Q_TILE_SIZE * T::D_TILE_SIZE / T::WARP_SIZE> v_q;
@@ -1105,7 +1105,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_kernel(pa_ka
     D_ACC o_scale = (l_final > D_ACC(0.0f)) ? (alpha / l_final) : D_ACC(0.0f);
     scale_output_tile<T>(v_o, o_scale);
 
-    auto g_o = make_gmem(reinterpret_cast<D_ATTN*>(kargs.out_ptr) + qo_gmem_offset);
+    auto g_o = make_gmem(reinterpret_cast<D_ATTN*>(kargs.out_ptr) + qo_gmem_offset, (kargs.H - h_block_start) * kargs.stride_qo_h * sizeof(D_ATTN));
     // Recompute lane/warp decomposition to prevent CSE with Q-load layout
     int lane_id_o = thread_id_x() % T::WARP_SIZE;
     asm volatile("" : "+v"(lane_id_o));

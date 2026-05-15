@@ -2,11 +2,11 @@
 
 Optimized sparse paged prefill attention using the [OPUS](https://github.com/ROCm/aiter) C++ template library for DeepSeek-V4 inference on AMD gfx950.
 
-This directory targets the DeepSeek-V4 MQA prefill shape: `H_Q = 128` query heads and `D = 512` head dimension. The kernel consumes two sparse K/V sources: a unified prefix cache with layout `[total_pages, D]` and a current extend K/V tensor with layout `[total_tokens, D]`.
+This directory targets the DeepSeek-V4 MQA prefill shape with configurable query-head count `H_Q` and `D = 512` head dimension. The kernel consumes two sparse K/V sources: a unified prefix cache with layout `[total_pages, D]` and a current extend K/V tensor with layout `[total_tokens, D]`.
 
 ## Features
 
-- DeepSeek-V4 prefill attention shape: BF16 or FP16 Q/K/V/O, `H_Q = 128`, `D = 512`.
+- DeepSeek-V4 prefill attention shape: BF16 or FP16 Q/K/V/O, configurable `H_Q`, `D = 512`.
 - MQA layout: Q/O carry the query-head dimension, while K/V rows are shared across query heads.
 - Paged sparse attention through two CSR index ranges per query token:
   - `prefix`: indices into `unified_kv_ptr` / `[total_pages, D]`.
@@ -58,7 +58,7 @@ Q/K/V/O tensor data is selected with `-dtype bf16|fp16`. `AttnSink` and accumula
 
 | Tensor | Shape | Notes |
 | --- | --- | --- |
-| `Q` | `[N, H_Q, D]` | Query tokens. DeepSeek-V4 uses `H_Q = 128`. |
+| `Q` | `[N, H_Q, D]` | Query tokens. `H_Q` is configurable, such as `64` for DeepSeek-V4-Flash and `128` for DeepSeek-V4-Pro. |
 | `UnifiedKV` | `[total_pages, D]` | Prefix K/V rows. |
 | `KV` | `[total_tokens, D]` | Current extend K/V rows. |
 | `AttnSink` | `[H_Q]` | Per-head sink score included in the softmax denominator only. |
@@ -87,7 +87,7 @@ pa_traits<16, 32, 512, 8, fp16_t>
 | `NUM_WARPS` | `8` | Waves per workgroup. |
 | `BLOCK_SIZE` | `512` | AMD wavefront size `64` times `8` waves. |
 
-One workgroup covers one query token and up to `Q_TILE_SIZE * NUM_WARPS = 128` query heads. This matches the DeepSeek-V4 MQA target where the number of query heads is fixed at 128.
+One workgroup covers one query token and up to `Q_TILE_SIZE * NUM_WARPS = 128` query heads. Arbitrary `H_Q` values are supported, while multiples of 128 give the best occupancy because every workgroup handles a full head tile.
 
 ## Build
 
@@ -122,7 +122,7 @@ Useful options:
 
 | Option | Default | Description |
 | --- | --- | --- |
-| `-h_q` | `128` | Number of query heads. Currently only `128` is supported. |
+| `-h_q` | `128` | Number of query heads. Supports arbitrary positive values; multiples of `128` have the best performance. |
 | `-d` | `512` | Head dimension. Only `512` is compiled in this directory. |
 | `-n` | `1024` | Number of query tokens in the standalone harness. |
 | `-total_pages` | `N` | Number of prefix rows in `UnifiedKV`. |
