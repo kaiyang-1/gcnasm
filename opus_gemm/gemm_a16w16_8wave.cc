@@ -142,17 +142,16 @@ inline __device__ auto make_layout_sa(int lane_id, int wave_id_m, int wave_id_n)
         opus::number<ceil_div(T::smem_m_rep, num_waves)>{},
         opus::number<T::T_M>{},
         opus::number<T::T_N>{},
-        opus::number<opus::get_warp_size()>{},
         opus::number<T::VEC_A>{});
 
     constexpr auto sa_block_dim = opus::make_tuple(
         opus::make_tuple(opus::y_dim{}, opus::p_dim{}, opus::p_dim{}),
-        opus::make_tuple(opus::p_dim{}, opus::y_dim{}));
+        opus::make_tuple(opus::y_dim{}));
 
     return opus::make_layout<T::VEC_A>(
         sa_block_shape,
-        opus::unfold_x_stride(sa_block_dim, sa_block_shape, opus::tuple{T::smem_linear_wave + T::smem_padding, 1_I}),
-        opus::unfold_p_coord(sa_block_dim, opus::tuple{wave_id_m, wave_id_n, lane_id}));
+        opus::unfold_x_stride(sa_block_dim, sa_block_shape, opus::tuple{opus::number<T::smem_linear_wave + T::smem_padding>{}, 1_I}),
+        opus::unfold_p_coord(sa_block_dim, opus::tuple{wave_id_m, wave_id_n}));
 }
 
 // Create layout for reading A matrix from shared memory to registers
@@ -175,7 +174,7 @@ inline __device__ auto make_layout_ra(int lane_id, int wave_id_m) {
 
     return opus::make_layout<T::VEC_A>(
         ra_block_shape,
-        opus::unfold_x_stride(ra_block_dim, ra_block_shape, opus::tuple{T::smem_linear_wave + T::smem_padding, 1_I}),
+        opus::unfold_x_stride(ra_block_dim, ra_block_shape, opus::tuple{opus::number<T::smem_linear_wave + T::smem_padding>{}, 1_I}),
         opus::unfold_p_coord(ra_block_dim, opus::tuple{lane_id_m % T::T_N, wave_id_m, lane_id_m / T::T_N, lane_id / T::W_M}));
 }
 
@@ -213,17 +212,16 @@ inline __device__ auto make_layout_sb(int lane_id, int wave_id_m, int wave_id_n)
         opus::number<T::smem_n_rep / num_waves>{},
         opus::number<T::T_M>{},
         opus::number<T::T_N>{},
-        opus::number<opus::get_warp_size()>{},
         opus::number<T::VEC_B>{});
 
     constexpr auto sb_block_dim = opus::make_tuple(
         opus::make_tuple(opus::y_dim{}, opus::p_dim{}, opus::p_dim{}),
-        opus::make_tuple(opus::p_dim{}, opus::y_dim{}));
+        opus::make_tuple(opus::y_dim{}));
 
     return opus::make_layout<T::VEC_B>(
         sb_block_shape,
-        opus::unfold_x_stride(sb_block_dim, sb_block_shape, opus::tuple{T::smem_linear_wave + T::smem_padding, 1_I}),
-        opus::unfold_p_coord(sb_block_dim, opus::tuple{wave_id_m, wave_id_n, lane_id}));
+        opus::unfold_x_stride(sb_block_dim, sb_block_shape, opus::tuple{opus::number<T::smem_linear_wave + T::smem_padding>{}, 1_I}),
+        opus::unfold_p_coord(sb_block_dim, opus::tuple{wave_id_m, wave_id_n}));
 }
 
 // Create layout for reading B matrix from shared memory to registers
@@ -247,7 +245,7 @@ inline __device__ auto make_layout_rb(int lane_id, int wave_id_n) {
 
     return opus::make_layout<T::VEC_B>(
         rb_block_shape,
-        opus::unfold_x_stride(rb_block_dim, rb_block_shape, opus::tuple{T::smem_linear_wave + T::smem_padding, 1_I}),
+        opus::unfold_x_stride(rb_block_dim, rb_block_shape, opus::tuple{opus::number<T::smem_linear_wave + T::smem_padding>{}, 1_I}),
         opus::unfold_p_coord(rb_block_dim, opus::tuple{wave_id_n / T::T_M, lane_id_n % T::T_N, wave_id_n % T::T_M, lane_id_n / T::T_N, lane_id / T::W_N}));
 }
 
