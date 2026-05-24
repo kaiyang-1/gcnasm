@@ -1,77 +1,47 @@
-#include <opus/hip_minimal.hpp>
-#include <random>
-#include <iostream>
-#include <numeric>
-#include <memory>
-#include <cstring>
-#include <cstdlib>
-#include <cassert>
-#include <omp.h>
+// 192x256 BF16 GEMM kernel template.
+// Included ONLY on the device-compile pass (see stub TU).
+#pragma once
 
 #include <opus/opus.hpp>
+#include "gemm_defs.h"
 
-using bf16_t = __bf16;
+namespace gemm_192x256 {
+
 using opus::operator""_I;
 
-#define CHECK_HIP(call)                                                                                   \
-    do {                                                                                                  \
-        hipError_t status_ = call;                                                                        \
-        if (status_ != hipSuccess) {                                                                      \
-            fprintf(stderr, "HIP error (%s:%d): %s\n", __FILE__, __LINE__, hipGetErrorString(status_));   \
-            exit(1);                                                                                      \
-        }                                                                                                 \
-    } while(0)
+// Kernel-internal derived traits: wave layout, smem layout, instruction counts.
+// Uses full B_M/B_N (no half-tile split) — distinct from the 256x256 family.
+template<typename UT>
+struct kernel_traits {
+    static constexpr int BLOCK_SIZE = UT::BLOCK_SIZE;
+    static constexpr int B_M = UT::B_M;
+    static constexpr int B_N = UT::B_N;
+    static constexpr int B_K = UT::B_K;
 
-#define CHECK_HIP_KERNEL_LAUNCH() CHECK_HIP(hipGetLastError())
+    using D_A   = typename UT::D_A;
+    using D_B   = typename UT::D_B;
+    using D_C   = typename UT::D_C;
+    using D_ACC = typename UT::D_ACC;
 
-__host__ __device__ constexpr inline int ceil_div(int a, int b) {
-    return (a + b - 1) / b;
-}
+    static constexpr int VEC_A = UT::VEC_A;
+    static constexpr int VEC_B = UT::VEC_B;
+    static constexpr int VEC_C = UT::VEC_C;
 
-// Configuration traits for GEMM kernel: tile sizes, data types, and MFMA layout
-template<int BLOCK_SIZE_,   // workgroup size
-        typename BLOCK_,    // opus::seq<m, n, k>, block_tile m/n/k
-        typename DTYPE_,   // opus::tuple<d_a, d_b, d_c, d_acc>, data type
-        typename VEC_>      // opus::seq<a, b, c>, vector size for global load/store
-struct opus_gemm_traits {
-    using BLOCK = opus::remove_cvref_t<BLOCK_>;
-    using DTYPE = opus::remove_cvref_t<DTYPE_>;
-    using VEC   = opus::remove_cvref_t<VEC_>;
-
-    static constexpr int BLOCK_SIZE = BLOCK_SIZE_;
-
-    static constexpr int B_M = opus::get<0>(BLOCK{});
-    static constexpr int B_N = opus::get<1>(BLOCK{});
-    static constexpr int B_K = opus::get<2>(BLOCK{});
-
-    using D_A   = opus::tuple_element_t<0, DTYPE>;
-    using D_B   = opus::tuple_element_t<1, DTYPE>;
-    using D_C   = opus::tuple_element_t<2, DTYPE>;
-    using D_ACC = opus::tuple_element_t<3, DTYPE>;
-    static_assert(std::is_same<D_A, D_B>::value);
-
-    static constexpr int T_M = 2; // waves along M
-    static constexpr int T_N = 4; // waves along N
-    static constexpr int T_K = 1; // waves along K
-
+    static constexpr int T_M = 2;
+    static constexpr int T_N = 4;
+    static constexpr int T_K = 1;
     static_assert(BLOCK_SIZE / opus::get_warp_size() == T_M * T_N * T_K);
     static_assert(T_K == 1);
 
-    static constexpr int W_M = 16; // wave gemm size M
-    static constexpr int W_N = 16; // wave gemm size N
-    static constexpr int W_K = 32; // wave gemm size K
-
+    static constexpr int W_M = 16;
+    static constexpr int W_N = 16;
+    static constexpr int W_K = 32;
     static_assert(B_K % (W_K * T_K) == 0);
 
-    static constexpr int E_M = B_M / (W_M * T_M); // expand, repeat how many times along each dim
-    static constexpr int E_N = B_N / (W_N * T_N); // expand, repeat how many times along each dim
-    static constexpr int E_K = B_K / (W_K * T_K); // expand, repeat how many times along each dim
+    static constexpr int E_M = B_M / (W_M * T_M);
+    static constexpr int E_N = B_N / (W_N * T_N);
+    static constexpr int E_K = B_K / (W_K * T_K);
 
-    static constexpr int VEC_A = opus::get<0>(VEC{});
-    static constexpr int VEC_B = opus::get<1>(VEC{});
-    static constexpr int VEC_C = opus::get<2>(VEC{});
-
-    // minimal compact pixels for async copy for one wave
     static_assert(VEC_A == 16 / sizeof(D_A));
     static constexpr int smem_linear_wave = opus::get_warp_size() * 16 / sizeof(D_A);
     static constexpr int smem_sub = smem_linear_wave / B_K;
@@ -79,31 +49,12 @@ struct opus_gemm_traits {
     static constexpr int smem_n_rep = B_N / smem_sub;
     static constexpr int smem_padding = 2 * 16 / sizeof(D_A);
 
-    // number of assembly instructions
     static constexpr int a_buffer_load_insts = B_M * B_K / (BLOCK_SIZE * VEC_A);
     static constexpr int b_buffer_load_insts = B_N * B_K / (BLOCK_SIZE * VEC_B);
     static constexpr int a_ds_read_insts = (E_M * E_K * W_M * W_K) / (opus::get_warp_size() * VEC_A);
     static constexpr int b_ds_read_insts = (E_N * E_K * W_N * W_K) / (opus::get_warp_size() * VEC_B);
 };
 
-// Kernel arguments
-struct opus_gemm_kargs {
-    const void* __restrict__ ptr_a;
-    const void* __restrict__ ptr_b;
-    void* __restrict__ ptr_c;
-    int m;
-    int n;
-    int k;
-    int batch;
-    int stride_a; // stride in unit of pixel
-    int stride_b;
-    int stride_c;
-    int stride_a_batch;
-    int stride_b_batch;
-    int stride_c_batch;
-};
-
-// Create layout for loading A matrix from global memory
 template<typename T>
 inline __device__ auto make_layout_ga(int lane_id, int wave_id_m, int wave_id_n, int stride_a) {
     constexpr int threads_k = T::B_K / T::VEC_A;
@@ -128,7 +79,6 @@ inline __device__ auto make_layout_ga(int lane_id, int wave_id_m, int wave_id_n,
         opus::unfold_p_coord(ga_block_dim, opus::tuple{wave_id_m, lane_id / threads_k, wave_id_n, lane_id % threads_k}));
 }
 
-// Create layout for storing A matrix to shared memory
 template<typename T>
 inline __device__ auto make_layout_sa(int lane_id, int wave_id_m, int wave_id_n) {
     constexpr int num_waves = T::BLOCK_SIZE / opus::get_warp_size();
@@ -149,7 +99,6 @@ inline __device__ auto make_layout_sa(int lane_id, int wave_id_m, int wave_id_n)
         opus::unfold_p_coord(sa_block_dim, opus::tuple{wave_id_m, wave_id_n}));
 }
 
-// Create layout for reading A matrix from shared memory to registers
 template<typename T>
 inline __device__ auto make_layout_ra(int lane_id, int wave_id_m) {
     constexpr int smem_sub_e_m = T::smem_sub / (T::W_M / T::T_N);
@@ -176,7 +125,6 @@ inline __device__ auto make_layout_ra(int lane_id, int wave_id_m) {
         opus::unfold_p_coord(ra_block_dim, opus::tuple{wave_id_m, lane_id_m % T::T_N, lane_id_m / T::T_N, lane_id / T::W_M}));
 }
 
-// Create layout for loading B matrix from global memory
 template<typename T>
 inline __device__ auto make_layout_gb(int lane_id, int wave_id_m, int wave_id_n, int stride_b) {
     constexpr int threads_k = T::B_K / T::VEC_B;
@@ -201,7 +149,6 @@ inline __device__ auto make_layout_gb(int lane_id, int wave_id_m, int wave_id_n,
         opus::unfold_p_coord(gb_block_dim, opus::tuple{wave_id_m, lane_id / threads_k, wave_id_n, lane_id % threads_k}));
 }
 
-// Create layout for storing B matrix to shared memory
 template<typename T>
 inline __device__ auto make_layout_sb(int lane_id, int wave_id_m, int wave_id_n) {
     constexpr int num_waves = T::BLOCK_SIZE / opus::get_warp_size();
@@ -222,7 +169,6 @@ inline __device__ auto make_layout_sb(int lane_id, int wave_id_m, int wave_id_n)
         opus::unfold_p_coord(sb_block_dim, opus::tuple{wave_id_m, wave_id_n}));
 }
 
-// Create layout for reading B matrix from shared memory to registers
 template<typename T>
 inline __device__ auto make_layout_rb(int lane_id, int wave_id_n) {
     constexpr auto rb_block_shape = opus::make_tuple(
@@ -247,18 +193,20 @@ inline __device__ auto make_layout_rb(int lane_id, int wave_id_n) {
         opus::unfold_p_coord(rb_block_dim, opus::tuple{wave_id_n / T::T_M, lane_id_n % T::T_N, wave_id_n % T::T_M, lane_id_n / T::T_N, lane_id / T::W_N}));
 }
 
-// GEMM kernel
-template<typename Traits>
-__global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gemm_a16w16_kernel(opus_gemm_kargs kargs) {
-    using namespace opus;
+} // namespace gemm_192x256
 
-    using T = opus::remove_cvref_t<Traits>;
+template<typename UserTraits>
+__global__ __launch_bounds__(UserTraits::BLOCK_SIZE, 2)
+void gemm_a16w16_192x256_kernel(opus_gemm_kargs kargs) {
+    using namespace opus;
+    using namespace gemm_192x256;
+    using opus::operator""_I;
+    using T = kernel_traits<opus::remove_cvref_t<UserTraits>>;
     using D_A = typename T::D_A;
     using D_B = typename T::D_B;
     using D_C = typename T::D_C;
     using D_ACC = typename T::D_ACC;
 
-    // Calculate global workgroup and tile indices
     int wgid = block_id_x();
     const int num_tiles_m = ceil_div(kargs.m, T::B_M);
     int row = (wgid % num_tiles_m) * T::B_M;
@@ -268,16 +216,13 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gemm_a16w16_kernel(opus
     int wave_id = __builtin_amdgcn_readfirstlane(thread_id_x() / get_warp_size());
     int lane_id = thread_id_x() % get_warp_size();
 
-    // Setup global memory pointers for A, B, C matrices
     auto g_a = make_gmem(reinterpret_cast<const D_A*>(kargs.ptr_a) + batch_id * kargs.stride_a_batch + row * kargs.stride_a, (kargs.m - row) * kargs.stride_a * sizeof(D_A));
     auto g_b = make_gmem(reinterpret_cast<const D_B*>(kargs.ptr_b) + batch_id * kargs.stride_b_batch + col * kargs.stride_b, (kargs.n - col) * kargs.stride_b * sizeof(D_B));
-    auto g_c = make_gmem(reinterpret_cast<D_C*>(kargs.ptr_c) + batch_id * kargs.stride_c_batch + row * kargs.stride_c + col);
+    auto g_c = make_gmem(reinterpret_cast<D_C*>(kargs.ptr_c) + batch_id * kargs.stride_c_batch + row * kargs.stride_c, (kargs.m - row) * kargs.stride_c * sizeof(D_C));
 
-    // Calculate wave position in the output tile
     int wave_id_m = wave_id / T::T_N;
     int wave_id_n = wave_id % T::T_N;
 
-    // Create memory layouts for loading A, B matrices
     auto u_ga = make_layout_ga<T>(lane_id, wave_id_m, wave_id_n, kargs.stride_a);
     auto u_sa = make_layout_sa<T>(lane_id, wave_id_m, wave_id_n);
     auto u_ra = make_layout_ra<T>(lane_id, wave_id_m);
@@ -285,7 +230,6 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gemm_a16w16_kernel(opus
     auto u_sb = make_layout_sb<T>(lane_id, wave_id_m, wave_id_n);
     auto u_rb = make_layout_rb<T>(lane_id, wave_id_n);
 
-    // Allocate shared memory for A/B subtiles and double buffer
     constexpr int smem_a_byte = T::smem_m_rep * (T::smem_linear_wave + T::smem_padding) * sizeof(D_A);
     __shared__ char smem_a[smem_a_byte * 2];
     smem<D_A> s_a[2] = {
@@ -298,7 +242,6 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gemm_a16w16_kernel(opus
     smem<D_B> sb_r1 = make_smem(reinterpret_cast<D_B*>(smem_b + smem_b_byte));
     smem<D_B> sb_w  = make_smem(reinterpret_cast<D_B*>(smem_b + 2 * smem_b_byte));
 
-    // Create tiled MFMA operation with specified tile sizes and types
     auto mma = make_tiled_mma<D_A, D_B, D_ACC>(
         seq<T::E_M, T::E_N, T::E_K>{},
         seq<1_I, T::T_N, T::T_K>{},
@@ -315,20 +258,17 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gemm_a16w16_kernel(opus
     const int loops = ceil_div(kargs.k, T::B_K);
     int tic = 0, toc = 1;
 
-    // Prologue
     async_load<T::VEC_A>(g_a, s_a[tic].ptr, u_ga, u_sa, k_offset(0));
     async_load<T::VEC_B>(g_b, sb_r0.ptr, u_gb, u_sb, k_offset(0));
     __builtin_amdgcn_sched_barrier(0);
     async_load<T::VEC_B>(g_b, sb_r1.ptr, u_gb, u_sb, k_offset(1));
-    __builtin_amdgcn_s_waitcnt(number<T::b_buffer_load_insts>{});
+    s_waitcnt_vmcnt(number<T::b_buffer_load_insts>{});
     __builtin_amdgcn_sched_barrier(0);
     __builtin_amdgcn_s_barrier();
 
     if (wave_id_m == 1) __builtin_amdgcn_s_barrier();
 
-    // Main loop
     for (int tile = 0; tile < loops - 2; tile += 2) {
-        // First tile
         async_load<T::VEC_A>(g_a, s_a[toc].ptr, u_ga, u_sa, k_offset(tile + 1));
         v_a = load<T::VEC_A>(s_a[tic], u_ra);
         v_b = load<T::VEC_B>(sb_r0, u_rb);
@@ -348,7 +288,6 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gemm_a16w16_kernel(opus
         __builtin_amdgcn_s_barrier();
         __builtin_amdgcn_sched_barrier(0);
 
-        // Second tile
         async_load<T::VEC_A>(g_a, s_a[tic].ptr, u_ga, u_sa, k_offset(tile + 2));
         v_a = load<T::VEC_A>(s_a[toc], u_ra);
         v_b = load<T::VEC_B>(sb_r1, u_rb);
@@ -368,14 +307,12 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gemm_a16w16_kernel(opus
         __builtin_amdgcn_s_barrier();
         __builtin_amdgcn_sched_barrier(0);
 
-        // Rotate s_b slots
         smem<D_B> tmp = sb_w;
         sb_w = sb_r1;
         sb_r1 = sb_r0;
         sb_r0 = tmp;
     }
 
-    // Epilogue
     {
         int tile = loops - 2;
 
@@ -415,234 +352,13 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gemm_a16w16_kernel(opus
 
     if (wave_id_m == 0) __builtin_amdgcn_s_barrier();
 
-    // Store results to global memory
     auto p_coord_c = opus::make_tuple(0_I, lane_id % mma.grpn_c, wave_id_n, lane_id / mma.grpn_c);
     auto u_gc = partition_layout_c<T::VEC_C>(mma, opus::make_tuple(kargs.stride_c, 1_I), p_coord_c);
-    auto u_gc_m = partition_layout_c<T::VEC_C>(mma, opus::make_tuple(1_I, 0_I), p_coord_c);
     auto u_gc_n = partition_layout_c<T::VEC_C>(mma, opus::make_tuple(0_I, 1_I), p_coord_c);
-
-    auto store_c = [&](auto& v_c) {
-        int m_base = row + wave_id_m * (T::B_M / T::T_M);
-
-        auto pred = [&](auto... ids) {
-            return (m_base + u_gc_m(ids...)) < kargs.m && (col + u_gc_n(ids...)) < kargs.n;
-        };
-
-        auto v_c_f16 = cast<D_C>(v_c);
-        store_if<T::VEC_C>(g_c, pred, v_c_f16, u_gc, wave_id_m * (T::B_M / T::T_M) * kargs.stride_c);
+    auto pred = [&](auto... ids) {
+        return (col + u_gc_n(ids...)) < kargs.n;
     };
 
-    store_c(v_c);
-}
-
-// Fill 2D matrix with random values in specified range
-template<typename T>
-void rand_vector_2d(T* ptr, int m, int n, int ld, float min_val = 0.0f, float max_val = 1.0f) {
-    #pragma omp parallel
-    {
-        std::random_device rd;
-        std::mt19937 gen(rd() + omp_get_thread_num());
-        std::uniform_real_distribution<float> dis(min_val, max_val);
-        #pragma omp for collapse(2)
-        for(int i = 0; i < m; i++) {
-            for(int j = 0; j < n; j++) {
-                ptr[i * ld + j] = static_cast<T>(dis(gen));
-            }
-        }
-    }
-}
-
-// Validate computed results against reference with error threshold
-template<typename T>
-bool valid_vector(const T* ref, const T* result, int n, float threshold = 1e-3f) {
-    int errors = 0;
-    for(int i = 0; i < n; i++) {
-        float diff = std::abs(static_cast<float>(ref[i]) - static_cast<float>(result[i]));
-        if(diff > threshold) {
-            if(errors < 10) {
-                printf("Error at %d: ref=%.6f, result=%.6f, diff=%.6f\n", 
-                       i, static_cast<float>(ref[i]), static_cast<float>(result[i]), diff);
-            }
-            errors++;
-            if(errors >= 10) break;
-        }
-    }
-    return errors == 0;
-}
-
-// CPU reference GEMM implementation for validation
-void gemm_ref(const bf16_t* a, const bf16_t* b, bf16_t* c, int m, int n, int k, int lda, int ldb, int ldc) {
-    #pragma omp parallel for collapse(2)
-    for(int i = 0; i < m; i++) {
-        for(int j = 0; j < n; j++) {
-            float sum = 0.0f;
-            for(int p = 0; p < k; p++) {
-                sum += static_cast<float>(a[i * lda + p]) * static_cast<float>(b[j * ldb + p]);
-            }
-            c[i * ldc + j] = static_cast<bf16_t>(sum);
-        }
-    }
-}
-
-// Benchmark kernel performance with warm-up and timing
-template<typename Traits>
-void benchmark_kernel(const opus_gemm_kargs& kargs, dim3 grid, dim3 block, int warmup = 50, int iterations = 100) {
-    // Warm up
-    for (int i = 0; i < warmup; ++i) {
-        gemm_a16w16_kernel<Traits><<<grid, block>>>(kargs);
-        CHECK_HIP_KERNEL_LAUNCH();
-    }
-
-    hipEvent_t start, stop;
-    CHECK_HIP(hipEventCreate(&start));
-    CHECK_HIP(hipEventCreate(&stop));
-
-    CHECK_HIP(hipDeviceSynchronize());
-    CHECK_HIP(hipEventRecord(start));
-
-    // Timed iterations
-    for (int i = 0; i < iterations; ++i) {
-        gemm_a16w16_kernel<Traits><<<grid, block>>>(kargs);
-        CHECK_HIP_KERNEL_LAUNCH();
-    }
-
-    CHECK_HIP(hipEventRecord(stop));
-    CHECK_HIP(hipEventSynchronize(stop));
-
-    float total_time = 0;
-    CHECK_HIP(hipEventElapsedTime(&total_time, start, stop));
-
-    CHECK_HIP(hipEventDestroy(start));
-    CHECK_HIP(hipEventDestroy(stop));
-
-    const float avg_time = total_time / iterations;
-    const std::size_t flop = std::size_t(2) * kargs.m * kargs.n * kargs.k * kargs.batch;
-    const float tflops = static_cast<float>(flop) / 1.0e9f / avg_time;
-
-    printf("Kernel Performance: avg_time=%.4f ms, %.2f TFlops\n", avg_time, tflops);
-}
-
-int main(int argc, char** argv) {
-    constexpr int BLOCK_SIZE = 512;
-    constexpr int BLOCK_M = 192;
-    constexpr int BLOCK_N = 256;
-    constexpr int BLOCK_K = 64;
-
-    using Traits = opus_gemm_traits<
-        BLOCK_SIZE,
-        opus::seq<BLOCK_M, BLOCK_N, BLOCK_K>,
-        opus::tuple<bf16_t, bf16_t, bf16_t, float>,
-        opus::seq<8, 8, 4>
-    >;
-
-    // Default problem sizes
-    int M = 256;
-    int N = 512;
-    int K = 128;
-    int batch = 8;
-
-    // Parse command line arguments: -m -n -k -b
-    for (int i = 1; i < argc; ++i) {
-        const char* arg = argv[i];
-        if ((std::strcmp(arg, "-m") == 0 || std::strcmp(arg, "--m") == 0) && i + 1 < argc) {
-            M = std::atoi(argv[++i]);
-        } else if ((std::strcmp(arg, "-n") == 0 || std::strcmp(arg, "--n") == 0) && i + 1 < argc) {
-            N = std::atoi(argv[++i]);
-        } else if ((std::strcmp(arg, "-k") == 0 || std::strcmp(arg, "--k") == 0) && i + 1 < argc) {
-            K = std::atoi(argv[++i]);
-        } else if ((std::strcmp(arg, "-b") == 0 || std::strcmp(arg, "--b") == 0) && i + 1 < argc) {
-            batch = std::atoi(argv[++i]);
-        }
-    }
-
-    if (M <= 0 || N <= 0 || K <= 0 || batch <= 0) {
-        std::cerr << "Invalid problem size: M,N,K and batch must be positive.\n";
-        return 1;
-    }
-
-    // Allocate host memory
-    auto host_a = std::make_unique<bf16_t[]>(batch * M * K);
-    auto host_b = std::make_unique<bf16_t[]>(batch * N * K);
-    auto host_c = std::make_unique<bf16_t[]>(batch * M * N);
-    auto host_c_out = std::make_unique<bf16_t[]>(batch * M * N);
-
-    // Initialize data
-    for(int b = 0; b < batch; b++) {
-        rand_vector_2d(host_a.get() + b * M * K, M, K, K, 0.0f, 1.0f);
-        rand_vector_2d(host_b.get() + b * N * K, N, K, K, -0.5f, 0.5f);
-    }
-
-    // Allocate device memory
-    bf16_t *dev_a, *dev_b, *dev_c;
-    CHECK_HIP(hipMalloc(&dev_a, batch * M * K * sizeof(bf16_t)));
-    CHECK_HIP(hipMalloc(&dev_b, batch * N * K * sizeof(bf16_t)));
-    CHECK_HIP(hipMalloc(&dev_c, batch * M * N * sizeof(bf16_t)));
-
-    // Copy to device
-    CHECK_HIP(hipMemcpy(dev_a, host_a.get(), batch * M * K * sizeof(bf16_t), hipMemcpyHostToDevice));
-    CHECK_HIP(hipMemcpy(dev_b, host_b.get(), batch * N * K * sizeof(bf16_t), hipMemcpyHostToDevice));
-
-    // Setup kernel arguments
-    opus_gemm_kargs kargs{};
-    kargs.ptr_a = dev_a;
-    kargs.ptr_b = dev_b;
-    kargs.ptr_c = dev_c;
-    kargs.m = M;
-    kargs.n = N;
-    kargs.k = K;
-    kargs.batch = batch;
-    kargs.stride_a = K;
-    kargs.stride_b = K;
-    kargs.stride_c = N;
-    kargs.stride_a_batch = M * K;
-    kargs.stride_b_batch = N * K;
-    kargs.stride_c_batch = M * N;
-
-    // Calculate grid dimensions and launch kernel
-    const int num_tiles_m = ceil_div(M, BLOCK_M);
-    const int num_tiles_n = ceil_div(N, BLOCK_N);
-    dim3 grid(num_tiles_m * num_tiles_n, 1, batch);
-    dim3 block(BLOCK_SIZE);
-
-    printf("Launching GEMM kernel: M=%d, N=%d, K=%d, grid=(%d,%d,%d), block=%d\n",
-           M, N, K, grid.x, grid.y, grid.z, BLOCK_SIZE);
-
-    gemm_a16w16_kernel<Traits><<<grid, block>>>(kargs);
-    
-    CHECK_HIP_KERNEL_LAUNCH();
-
-    // Copy results back to host for validation
-    CHECK_HIP(hipMemcpy(host_c_out.get(), dev_c, batch * M * N * sizeof(bf16_t), hipMemcpyDeviceToHost));
-
-    // Verify each batch against CPU reference implementation
-    bool all_valid = true;
-    for(int b = 0; b < batch; b++) {
-        gemm_ref(
-            host_a.get() + b * M * K,
-            host_b.get() + b * N * K,
-            host_c.get() + b * M * N,
-            M, N, K, K, K, N);
-        bool valid = valid_vector(
-            host_c.get() + b * M * N,
-            host_c_out.get() + b * M * N,
-            M * N, 5e-1f);
-        printf("[GEMM batch %d/%d: %dx%dx%d, block_%dx%dx%d] %s\n", 
-               b + 1, batch, M, N, K, BLOCK_M, BLOCK_N, BLOCK_K,
-               valid ? "✓ VALID" : "✗ FAIL");
-        all_valid = all_valid && valid;
-    }
-
-    printf("\n[Overall] %s\n", all_valid ? "✓ ALL BATCHES VALID" : "✗ SOME BATCHES FAILED");
-
-    // Benchmark kernel performance
-    printf("\n");
-    benchmark_kernel<Traits>(kargs, grid, block);
-    printf("\n");
-
-    // Cleanup
-    CHECK_HIP(hipFree(dev_a));
-    CHECK_HIP(hipFree(dev_b));
-    CHECK_HIP(hipFree(dev_c));
-
-    return all_valid ? 0 : 1;
+    auto v_c_f16 = cast<D_C>(v_c);
+    store_if<T::VEC_C>(g_c, pred, v_c_f16, u_gc, wave_id_m * (T::B_M / T::T_M) * kargs.stride_c + col);
 }

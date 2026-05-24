@@ -1,7 +1,7 @@
 #!/bin/sh
 
-SRC=gemm_a16w16_8wave.cc
-OUT=gemm_a16w16_8wave.exe
+SRC=gemm_a8w8_8wave.cc
+OUT=gemm_a8w8_8wave.exe
 TOP=`pwd`
 BUILD="$TOP/build/"
 OPUS_INCLUDE_DIR=/path/to/aiter/csrc/include
