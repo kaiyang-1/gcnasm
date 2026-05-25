@@ -1,6 +1,6 @@
-// Unified host driver: launches both 256x256 and 192x256 BF16 GEMM kernels
-// against the same input matrices, validates each against the CPU reference,
-// and benchmarks each.
+// Unified host driver: launches both the quad-subtile and mono-tile BF16 GEMM
+// kernels against the same input matrices, validates each against the CPU
+// reference, and benchmarks each.
 #include <opus/hip_minimal.hpp>
 #include <random>
 #include <iostream>
@@ -14,19 +14,9 @@
 
 // Device-stub declarations resolved by linking against the per-kernel TUs.
 template<typename Traits>
-__global__ void gemm_a16w16_256x256_kernel(opus_gemm_kargs kargs);
+__global__ void gemm_a16w16_quad_subtile_kernel(opus_gemm_kargs kargs);
 template<typename Traits>
-__global__ void gemm_a16w16_192x256_kernel(opus_gemm_kargs kargs);
-
-// Compile-time dispatch by tile size: select kernel from Traits::B_M.
-template<typename Traits>
-inline void gemm_launch(const opus_gemm_kargs& kargs, dim3 grid, dim3 block) {
-    if constexpr (Traits::B_M == 256) {
-        gemm_a16w16_256x256_kernel<Traits><<<grid, block>>>(kargs);
-    } else {
-        gemm_a16w16_192x256_kernel<Traits><<<grid, block>>>(kargs);
-    }
-}
+__global__ void gemm_a16w16_mono_tile_kernel(opus_gemm_kargs kargs);
 
 #define CHECK_HIP(call)                                                                                   \
     do {                                                                                                  \
@@ -86,11 +76,13 @@ void gemm_ref(const bf16_t* a, const bf16_t* b, bf16_t* c, int m, int n, int k, 
     }
 }
 
-template<typename Traits>
-void benchmark_kernel(const opus_gemm_kargs& kargs, dim3 grid, dim3 block,
-                      int warmup = 50, int iterations = 100) {
+struct bench_result { float avg_ms; float tflops; };
+
+template<typename Launch>
+bench_result benchmark_kernel(Launch&& launch, const opus_gemm_kargs& kargs,
+                              int warmup = 50, int iterations = 100) {
     for (int i = 0; i < warmup; ++i) {
-        gemm_launch<Traits>(kargs, grid, block);
+        launch();
         CHECK_HIP_KERNEL_LAUNCH();
     }
 
@@ -102,7 +94,7 @@ void benchmark_kernel(const opus_gemm_kargs& kargs, dim3 grid, dim3 block,
     CHECK_HIP(hipEventRecord(start));
 
     for (int i = 0; i < iterations; ++i) {
-        gemm_launch<Traits>(kargs, grid, block);
+        launch();
         CHECK_HIP_KERNEL_LAUNCH();
     }
 
@@ -115,11 +107,10 @@ void benchmark_kernel(const opus_gemm_kargs& kargs, dim3 grid, dim3 block,
     CHECK_HIP(hipEventDestroy(start));
     CHECK_HIP(hipEventDestroy(stop));
 
-    const float avg_time = total_time / iterations;
+    const float avg_ms = total_time / iterations;
     const std::size_t flop = std::size_t(2) * kargs.m * kargs.n * kargs.k * kargs.batch;
-    const float tflops = static_cast<float>(flop) / 1.0e9f / avg_time;
-
-    printf("Kernel Performance: avg_time=%.4f ms, %.2f TFlops\n", avg_time, tflops);
+    const float tflops = static_cast<float>(flop) / 1.0e9f / avg_ms;
+    return {avg_ms, tflops};
 }
 
 int main(int argc, char** argv) {
@@ -147,7 +138,7 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    printf("GEMM: M=%d, N=%d, K=%d, batch=%d\n", M, N, K, batch);
+    printf("BF16 GEMM: M=%d, N=%d, K=%d, Batch=%d\n", M, N, K, batch);
 
     // Allocate host buffers (one shared A/B and one CPU reference; per-kernel C-out).
     auto host_a       = std::make_unique<bf16_t[]>(batch * M * K);
@@ -184,8 +175,7 @@ int main(int argc, char** argv) {
     kargs.stride_b_batch = N * K;
     kargs.stride_c_batch = M * N;
 
-    // Compute CPU reference once; both kernels are validated against it.
-    printf("\nComputing CPU reference...\n");
+    printf("Computing CPU reference ...\n");
     for(int b = 0; b < batch; b++) {
         gemm_ref(
             host_a.get() + b * M * K,
@@ -194,55 +184,58 @@ int main(int argc, char** argv) {
             M, N, K, K, K, N);
     }
 
-    // Run one kernel variant: launch -> D->H -> validate per-batch -> benchmark.
-    auto run = [&]<typename Traits>(Traits, bf16_t* host_c_out, const char* label) -> bool {
+    struct kernel_result { const char* label; bool ok; int passed; int total; float ms; float tflops; };
+
+    // Run one (Traits, kernel) pair: launch -> D->H -> validate per-batch -> benchmark.
+    auto run = [&]<typename Traits>(Traits, auto kernel, bf16_t* host_c_out, const char* label) -> kernel_result {
         const int num_tiles_m = ceil_div(M, Traits::B_M);
         const int num_tiles_n = ceil_div(N, Traits::B_N);
         dim3 grid(num_tiles_m * num_tiles_n, 1, batch);
         dim3 block(Traits::BLOCK_SIZE);
 
-        printf("\n=== %s ===\n", label);
-        printf("Launch: block_tile=%dx%dx%d, grid=(%d,%d,%d), block=%d\n",
-               Traits::B_M, Traits::B_N, Traits::B_K,
+        auto launch = [&] { kernel<<<grid, block>>>(kargs); };
+
+        printf("\n[%s]  tile=%dx%dx%d  grid=%dx%dx%d  block=%d\n",
+               label, Traits::B_M, Traits::B_N, Traits::B_K,
                grid.x, grid.y, grid.z, (int)block.x);
 
-        gemm_launch<Traits>(kargs, grid, block);
+        launch();
         CHECK_HIP_KERNEL_LAUNCH();
-
         CHECK_HIP(hipMemcpy(host_c_out, dev_c, batch * M * N * sizeof(bf16_t), hipMemcpyDeviceToHost));
 
-        bool all_valid = true;
+        int passed = 0;
         for(int b = 0; b < batch; b++) {
-            bool valid = valid_vector(
-                host_c_ref.get() + b * M * N,
-                host_c_out + b * M * N,
-                M * N, 5e-1f);
-            printf("[%s batch %d/%d: %dx%dx%d, block_%dx%dx%d] %s\n",
-                   label, b + 1, batch, M, N, K,
-                   Traits::B_M, Traits::B_N, Traits::B_K,
-                   valid ? "✓ VALID" : "✗ FAIL");
-            all_valid = all_valid && valid;
+            if (valid_vector(host_c_ref.get() + b * M * N, host_c_out + b * M * N, M * N, 5e-1f)) {
+                ++passed;
+            }
         }
-        printf("[%s overall] %s\n", label,
-               all_valid ? "✓ ALL BATCHES VALID" : "✗ SOME BATCHES FAILED");
+        const bool ok = (passed == batch);
+        printf("  validate : %s  (%d/%d batches)\n",
+               ok ? "PASS" : "FAIL", passed, batch);
 
-        benchmark_kernel<Traits>(kargs, grid, block);
-        return all_valid;
+        auto bench = benchmark_kernel(launch, kargs);
+        printf("  perf    : %7.4f ms  %8.2f TFlops\n", bench.avg_ms, bench.tflops);
+
+        return {label, ok, passed, batch, bench.avg_ms, bench.tflops};
     };
 
-    using Traits256 = opus_gemm_traits<512, 256, 256, 64, bf16_t, bf16_t, bf16_t, float, 8, 8, 4>;
-    using Traits192 = opus_gemm_traits<512, 192, 256, 64, bf16_t, bf16_t, bf16_t, float, 8, 8, 4>;
+    using TraitsQuad = opus_gemm_traits<512, 256, 256, 64, bf16_t, bf16_t, bf16_t, float, 8, 8, 4>;
+    using TraitsMono = opus_gemm_traits<512, 192, 256, 64, bf16_t, bf16_t, bf16_t, float, 8, 8, 4>;
 
-    bool v1 = run(Traits256{}, host_c_256.get(), "256x256");
-    bool v2 = run(Traits192{}, host_c_192.get(), "192x256");
+    auto r_quad = run(TraitsQuad{}, gemm_a16w16_quad_subtile_kernel<TraitsQuad>,
+                      host_c_256.get(), "quad_subtile 256x256");
+    auto r_mono = run(TraitsMono{}, gemm_a16w16_mono_tile_kernel<TraitsMono>,
+                      host_c_192.get(), "mono_tile    192x256");
 
-    printf("\n=== Summary ===\n");
-    printf("  256x256: %s\n", v1 ? "PASS" : "FAIL");
-    printf("  192x256: %s\n", v2 ? "PASS" : "FAIL");
+    printf("\nSummary\n");
+    for (const auto& r : {r_quad, r_mono}) {
+        printf("  %-22s  %s  %8.2f TFlops\n",
+               r.label, r.ok ? "PASS" : "FAIL", r.tflops);
+    }
 
     CHECK_HIP(hipFree(dev_a));
     CHECK_HIP(hipFree(dev_b));
     CHECK_HIP(hipFree(dev_c));
 
-    return (v1 && v2) ? 0 : 1;
+    return 0;
 }
