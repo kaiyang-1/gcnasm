@@ -82,7 +82,3 @@ Command:
 |  8192 | **1556.25** | 1324.87 |
 |  9216 |  1379.05 | **1490.14** |
 | 10240 | **1425.76** | 1344.00 |
-
-Neither kernel dominates across all shapes — quad-subtile wins on most
-power-of-two K, mono-tile wins on several intermediate shapes — which is the
-main reason both are kept.

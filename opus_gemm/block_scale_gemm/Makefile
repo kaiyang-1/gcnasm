@@ -20,7 +20,7 @@ $(BUILD):
 	mkdir -p $(BUILD)
 
 $(BUILD)/%.o: %.cc gemm_a8w8_blockscale_kernel_template.hpp gemm_a8w8_blockscale_common.h | $(BUILD)
-	$(HIPCC) $< $(COMMON_FLAGS) -D__HIPCC_RTC__ -Rpass-analysis=kernel-resource-usage -c -o $@
+	$(HIPCC) $< $(COMMON_FLAGS) -D__HIPCC_RTC__ -Rpass-analysis=kernel-resource-usage -save-temps=obj -c -o $@
 
 $(HOST_OBJ): $(HOST_SRC) gemm_a8w8_blockscale_common.h | $(BUILD)
 	$(HIPCC) $< $(COMMON_FLAGS) -c -o $@
