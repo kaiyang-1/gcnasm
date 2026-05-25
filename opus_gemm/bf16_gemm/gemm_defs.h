@@ -37,8 +37,7 @@ struct opus_gemm_kargs {
 // these and computes its own derived constants (HALF_B_M, E_M, smem_*, ...).
 template<int BLOCK_SIZE_,
          int B_M_, int B_N_, int B_K_,
-         typename D_A_, typename D_B_, typename D_C_, typename D_ACC_,
-         int VEC_A_, int VEC_B_, int VEC_C_>
+         typename D_A_, typename D_B_, typename D_C_, typename D_ACC_>
 struct opus_gemm_traits {
     static constexpr int BLOCK_SIZE = BLOCK_SIZE_;
 
@@ -52,7 +51,7 @@ struct opus_gemm_traits {
     using D_ACC = D_ACC_;
     static_assert(std::is_same<D_A, D_B>::value);
 
-    static constexpr int VEC_A = VEC_A_;
-    static constexpr int VEC_B = VEC_B_;
-    static constexpr int VEC_C = VEC_C_;
+    static constexpr int VEC_A = 8;
+    static constexpr int VEC_B = 8;
+    static constexpr int VEC_C = 8;
 };

@@ -200,6 +200,28 @@ inline __device__ auto make_layout_rb(int lane_id, int wave_id_n) {
         opus::unfold_p_coord(rb_block_dim, opus::tuple{wave_id_n / T::T_M, lane_id_n % T::T_N, wave_id_n % T::T_M, lane_id_n / T::T_N, lane_id / T::W_N}));
 }
 
+template<typename T>
+inline __device__ auto make_layout_gc(int lane_id, int wave_id_m, int wave_id_n, int stride_c) {
+    constexpr auto gc_block_shape = opus::make_tuple(
+        opus::number<T::E_M>{},
+        opus::number<T::T_M>{},
+        opus::number<T::W_M>{},
+        opus::number<T::E_N / (opus::get_warp_size() / T::W_M / (T::W_N / T::VEC_C))>{},
+        opus::number<opus::get_warp_size() / T::W_M / (T::W_N / T::VEC_C)>{},
+        opus::number<T::T_N>{},
+        opus::number<T::W_N / T::VEC_C>{},
+        opus::number<T::VEC_C>{});
+
+    constexpr auto gc_block_dim = opus::make_tuple(
+        opus::make_tuple(opus::y_dim{}, opus::p_dim{}, opus::p_dim{}),
+        opus::make_tuple(opus::y_dim{}, opus::p_dim{}, opus::p_dim{}, opus::p_dim{}, opus::y_dim{}));
+
+    return opus::make_layout<T::VEC_C>(
+        gc_block_shape,
+        opus::unfold_x_stride(gc_block_dim, gc_block_shape, opus::tuple{stride_c, 1_I}),
+        opus::unfold_p_coord(gc_block_dim, opus::tuple{wave_id_m, lane_id % T::W_M, (lane_id / T::W_M) % (T::W_N / T::VEC_C), wave_id_n, (lane_id / T::W_M) / (T::W_N / T::VEC_C)}));
+}
+
 } // namespace gemm_quad_subtile
 
 template<typename UserTraits>
@@ -457,24 +479,26 @@ void gemm_a16w16_quad_subtile_kernel(opus_gemm_kargs kargs) {
 
     if (wave_id_m == 0) __builtin_amdgcn_s_barrier();
 
-    auto p_coord_c = opus::make_tuple(wave_id_m, lane_id % mma.grpn_c, wave_id_n, lane_id / mma.grpn_c);
-    auto u_gc = partition_layout_c<T::VEC_C>(mma, opus::make_tuple(kargs.stride_c, 1_I), p_coord_c);
-    auto u_gc_n = partition_layout_c<T::VEC_C>(mma, opus::make_tuple(0_I, 1_I), p_coord_c);
-
+    auto u_gc = make_layout_gc<T>(lane_id, wave_id_m, wave_id_n, kargs.stride_c);
     auto c_offset = [&](int half_tile_m, int half_tile_n) {
         return half_tile_m * T::HALF_B_M * kargs.stride_c + half_tile_n * T::HALF_B_N + col;
     };
 
     auto store_c = [&](auto& v_c_in, int half_tile_m, int half_tile_n) {
-        int g_c_offset = c_offset(half_tile_m, half_tile_n);
-        int n_base = col + half_tile_n * T::HALF_B_N;
-
-        auto pred = [&](auto... ids) {
-            return (n_base + u_gc_n(ids...)) < kargs.n;
-        };
-
         auto v_c_f16 = cast<D_C>(v_c_in);
-        store_if<T::VEC_C>(g_c, pred, v_c_f16, u_gc, g_c_offset);
+        static_assert(sizeof(D_C) * 8 % sizeof(u32_t) == 0);
+        constexpr int u32_per_chunk = sizeof(D_C) * 8 / sizeof(u32_t);  // = 4
+        constexpr int num_chunks = sizeof(v_c_f16) / (sizeof(u32_t) * u32_per_chunk);
+        auto* p_u32 = reinterpret_cast<u32_t*>(&v_c_f16);
+        static_for<num_chunks>([&](auto c) {
+            auto* p = p_u32 + c.value * u32_per_chunk;
+            auto r0 = __builtin_amdgcn_permlane16_swap(p[0], p[2], false, true);
+            auto r1 = __builtin_amdgcn_permlane16_swap(p[1], p[3], false, true);
+            p[0] = r0[0]; p[2] = r0[1];
+            p[1] = r1[0]; p[3] = r1[1];
+        });
+
+        store<T::VEC_C>(g_c, v_c_f16, u_gc, c_offset(half_tile_m, half_tile_n));
     };
 
     store_c(v_c[0][0], 0, 0);

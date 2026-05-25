@@ -9,9 +9,9 @@
 template<typename Traits>
 __global__ void gemm_a16w16_quad_subtile_kernel(opus_gemm_kargs kargs) {}
 template __global__ void gemm_a16w16_quad_subtile_kernel<
-    opus_gemm_traits<512, 256, 256, 64, bf16_t, bf16_t, bf16_t, float, 8, 8, 4>>(opus_gemm_kargs);
+    opus_gemm_traits<512, 256, 256, 64, bf16_t, bf16_t, bf16_t, float>>(opus_gemm_kargs);
 #else
 #include "gemm_a16w16_quad_subtile_kernel_template.hpp"
 template __global__ void gemm_a16w16_quad_subtile_kernel<
-    opus_gemm_traits<512, 256, 256, 64, bf16_t, bf16_t, bf16_t, float, 8, 8, 4>>(opus_gemm_kargs);
+    opus_gemm_traits<512, 256, 256, 64, bf16_t, bf16_t, bf16_t, float>>(opus_gemm_kargs);
 #endif

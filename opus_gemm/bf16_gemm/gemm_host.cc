@@ -219,8 +219,8 @@ int main(int argc, char** argv) {
         return {label, ok, passed, batch, bench.avg_ms, bench.tflops};
     };
 
-    using TraitsQuad = opus_gemm_traits<512, 256, 256, 64, bf16_t, bf16_t, bf16_t, float, 8, 8, 4>;
-    using TraitsMono = opus_gemm_traits<512, 192, 256, 64, bf16_t, bf16_t, bf16_t, float, 8, 8, 4>;
+    using TraitsQuad = opus_gemm_traits<512, 256, 256, 64, bf16_t, bf16_t, bf16_t, float>;
+    using TraitsMono = opus_gemm_traits<512, 192, 256, 64, bf16_t, bf16_t, bf16_t, float>;
 
     auto r_quad = run(TraitsQuad{}, gemm_a16w16_quad_subtile_kernel<TraitsQuad>,
                       host_c_256.get(), "quad_subtile 256x256");
