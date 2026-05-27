@@ -429,6 +429,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gqa_d128_kernel(opus_gq
     attn_sub_row<T>(v_s[0], m_row);
     asm volatile("" : "+v"(v_s[0]) ::);
     attn_exp2_slice<T, 0, s_half_len>(v_s[0]);
+    asm volatile("" : "+v"(v_s[0]) ::);
     __builtin_amdgcn_sched_barrier(0);
     __builtin_amdgcn_s_barrier();
     __builtin_amdgcn_sched_barrier(0);
@@ -474,22 +475,22 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gqa_d128_kernel(opus_gq
         sched_barrier_pairs<4, 5, 2>();
         bool below_thresh = ((row_max - m_row) <= RESCALE_THRESHOLD);
         bool all_below = (__builtin_amdgcn_ballot_w64(below_thresh) == __builtin_amdgcn_read_exec());
-        if (__builtin_expect(all_below, 1)) {
-            row_max = m_row;
-        } else {
-            rescale_m = __builtin_amdgcn_exp2f(m_row - row_max);
-            scale_output_tile<T>(v_o, rescale_m);
-            l_row *= rescale_m;
-            m_row = row_max;
-        }
+        row_max = all_below ? m_row : row_max;
         v_o = mma1.step_k(1_I, v_p, v_v, v_o);
         v_o = mma1.step_k(2_I, v_p, v_v, v_o);
         v_o = mma1.step_k(3_I, v_p, v_v, v_o);
         attn_sub_row<T>(v_s[1], row_max);
         asm volatile("" : "+v"(v_s[1]) ::);
         attn_exp2_slice<T, 0, s_half_len>(v_s[1]);
+        asm volatile("" : "+v"(v_s[1]) ::);
         sched_barrier_pairs<6, 5, 2>();
         sched_barrier_exp_pairs<6, 3, 2>();
+        if (!all_below) {
+            rescale_m = __builtin_amdgcn_exp2f(m_row - row_max);
+            scale_output_tile<T>(v_o, rescale_m);
+            l_row *= rescale_m;
+            m_row = row_max;
+        }
         __builtin_amdgcn_s_setprio(0);
         __builtin_amdgcn_sched_barrier(0);
         __builtin_amdgcn_s_barrier();
@@ -538,22 +539,22 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gqa_d128_kernel(opus_gq
         sched_barrier_pairs<4, 5, 4>();
         below_thresh = ((row_max - m_row) <= RESCALE_THRESHOLD);
         all_below = (__builtin_amdgcn_ballot_w64(below_thresh) == __builtin_amdgcn_read_exec());
-        if (__builtin_expect(all_below, 1)) {
-            row_max = m_row;
-        } else {
-            rescale_m = __builtin_amdgcn_exp2f(m_row - row_max);
-            scale_output_tile<T>(v_o, rescale_m);
-            l_row *= rescale_m;
-            m_row = row_max;
-        }
+        row_max = all_below ? m_row : row_max;
         v_o = mma1.step_k(1_I, v_p, v_v, v_o);
         v_o = mma1.step_k(2_I, v_p, v_v, v_o);
         v_o = mma1.step_k(3_I, v_p, v_v, v_o);
         attn_sub_row<T>(v_s[0], row_max);
         asm volatile("" : "+v"(v_s[0]) ::);
         attn_exp2_slice<T, 0, s_half_len>(v_s[0]);
+        asm volatile("" : "+v"(v_s[0]) ::);
         sched_barrier_pairs<6, 5, 4>();
         sched_barrier_exp_pairs<6, 3, 4>();
+        if (!all_below) {
+            rescale_m = __builtin_amdgcn_exp2f(m_row - row_max);
+            scale_output_tile<T>(v_o, rescale_m);
+            l_row *= rescale_m;
+            m_row = row_max;
+        }
         __builtin_amdgcn_s_setprio(0);
         __builtin_amdgcn_sched_barrier(0);
         __builtin_amdgcn_s_barrier();
@@ -606,6 +607,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gqa_d128_kernel(opus_gq
     attn_sub_row<T>(v_s[1], row_max);
     asm volatile("" : "+v"(v_s[1]) ::);
     attn_exp2_slice<T, 0, s_half_len>(v_s[1]);
+    asm volatile("" : "+v"(v_s[1]) ::);
     sched_barrier_pairs<10, 5, 6>();
     sched_barrier_exp_pairs<6, 3, 6>();
     __builtin_amdgcn_sched_barrier(0);
@@ -662,6 +664,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gqa_d128_kernel(opus_gq
     attn_sub_row<T>(v_s[0], row_max);
     asm volatile("" : "+v"(v_s[0]) ::);
     attn_exp2_slice<T, 0, s_half_len>(v_s[0]);
+    asm volatile("" : "+v"(v_s[0]) ::);
     sched_barrier_pairs<10, 5, 8>();
     sched_barrier_exp_pairs<6, 3, 8>();
     __builtin_amdgcn_sched_barrier(0);
@@ -716,6 +719,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gqa_d128_kernel(opus_gq
     attn_sub_row<T>(v_s[1], row_max);
     asm volatile("" : "+v"(v_s[1]) ::);
     attn_exp2_slice<T, 0, s_half_len>(v_s[1]);
+    asm volatile("" : "+v"(v_s[1]) ::);
     sched_barrier_pairs<10, 5, 10>();
     sched_barrier_exp_pairs<6, 3, 10>();
     __builtin_amdgcn_sched_barrier(0);

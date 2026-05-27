@@ -118,7 +118,7 @@ The timing numbers below were collected with the kernel resource-report/temp-fil
 
 | File | Time | VGPRs | SGPRs | Spill | Occ | LDS (Byte) |
 |------|:----:|:-----:|:-----:|:-----:|:---:|:----------:|
-| `gqa_d128_kernel_causal.cc` | 1.21s | 237 | 50 | 0 | 2 | 68096 |
+| `gqa_d128_kernel_causal.cc` | 1.21s | 238 | 50 | 0 | 2 | 68096 |
 | `gqa_d128_kernel_noncausal.cc` | 1.12s | 232 | 44 | 0 | 2 | 68096 |
 | `gqa_d512_kernel_causal.cc` | 1.34s | 248 | 56 | 0 | 2 | 135168 |
 | `gqa_d512_kernel_noncausal.cc` | 1.38s | 248 | 52 | 0 | 2 | 135168 |
